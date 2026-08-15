@@ -1,0 +1,27 @@
+# Python virtual environment
+.venv/
+
+# Secrets
+.env
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Python tooling and build artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Stage 0 local evidence and artifacts
+.artifacts/data_spike/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
