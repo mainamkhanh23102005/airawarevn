@@ -339,13 +339,20 @@ def main(argv=None):
     subparsers.add_parser("discovery")
     coverage_parser = subparsers.add_parser("coverage")
     coverage_parser.add_argument("--sensor-id", required=True, type=int)
+    weather_parser = subparsers.add_parser("weather")
+    weather_parser.add_argument("--sensor-id", required=True, type=int)
+    weather_parser.add_argument("--pm25-normalized-path", required=True)
     args = parser.parse_args(argv)
     import os
     from pathlib import Path
 
     import httpx
-    from scripts import openaq
+    from scripts import openaq, openmeteo
 
+    if args.command == "weather":
+        with httpx.Client(timeout=30) as client:
+            openmeteo.run(client, args.sensor_id, Path(args.pm25_normalized_path), output=None)
+        return
     api_key = os.environ.get("OPENAQ_API_KEY")
     if not api_key:
         parser.error("OPENAQ_API_KEY is required")
