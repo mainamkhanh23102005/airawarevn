@@ -60,6 +60,18 @@ class CandidatePeriodSelectionTests(unittest.TestCase):
 
         self.assertEqual(periods, [[(2022, 10), (2022, 11)], [(2023, 1), (2023, 2)]])
 
+    def test_sparse_internal_observed_months_are_structural_when_source_range_spans_boundaries(self):
+        records = [measurement(datetime(2022, month, 15, tzinfo=HANOI).astimezone(UTC), None) for month in range(1, 13)]
+
+        months = spike.complete_calendar_months(
+            records,
+            HANOI,
+            datetime(2022, 1, 1, tzinfo=HANOI).astimezone(UTC),
+            datetime(2023, 1, 1, tzinfo=HANOI).astimezone(UTC),
+        )
+
+        self.assertEqual(months, [(2022, month) for month in range(1, 13)])
+
     def test_partial_boundary_months_cannot_form_candidate_boundaries(self):
         start = datetime(2022, 10, 1, tzinfo=HANOI).astimezone(UTC)
         end = datetime(2023, 12, 1, tzinfo=HANOI).astimezone(UTC)
@@ -80,6 +92,27 @@ class CandidatePeriodSelectionTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].start_local, datetime(2022, 11, 1, tzinfo=HANOI))
         self.assertEqual(candidates[0].end_local, datetime(2023, 11, 1, tzinfo=HANOI))
+
+    def test_source_span_excludes_partial_boundaries_retains_sparse_internal_and_breaks_zero_month(self):
+        source_start = datetime(2022, 1, 15, tzinfo=HANOI).astimezone(UTC)
+        source_end = datetime(2023, 3, 15, tzinfo=HANOI).astimezone(UTC)
+        records = [measurement(datetime(2022, month, 15, tzinfo=HANOI).astimezone(UTC)) for month in range(1, 13) if month != 6]
+        records += [measurement(datetime(2023, month, 15, tzinfo=HANOI).astimezone(UTC)) for month in range(1, 4)]
+
+        months = spike.complete_calendar_months(records, HANOI, source_start, source_end)
+
+        self.assertNotIn((2022, 1), months)
+        self.assertNotIn((2023, 3), months)
+        self.assertNotIn((2022, 6), months)
+        self.assertEqual(spike.consecutive_calendar_periods(months)[0][-1], (2022, 5))
+        self.assertEqual(spike.consecutive_calendar_periods(months)[1][0], (2022, 7))
+
+    def test_candidate_requires_actual_contained_november_to_march_winter(self):
+        months = [(2022, month) for month in range(12, 13)] + [(2023, month) for month in range(1, 13)]
+
+        selected = spike.select_primary_candidate_interval(months, HANOI)
+
+        self.assertIsNone(selected)
 
     def test_selects_most_recent_structurally_qualifying_twelve_month_interval(self):
         months = [(2021, month) for month in range(11, 13)] + [

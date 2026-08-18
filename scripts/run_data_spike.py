@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -198,12 +199,17 @@ def consecutive_calendar_periods(months):
 def source_present_months(records, zone):
     return sorted({(normalize_to_utc(r["event_time"]).astimezone(zone).year, normalize_to_utc(r["event_time"]).astimezone(zone).month) for r in records})
 
-def complete_calendar_months(records, zone):
-    present = {normalize_to_utc(r["event_time"]) for r in records}
+def complete_calendar_months(records, zone, source_start=None, source_end=None):
+    if not records:
+        return []
+    event_times = [normalize_to_utc(record["event_time"]) for record in records]
+    source_start = normalize_to_utc(source_start) if source_start else min(event_times)
+    source_end = normalize_to_utc(source_end) if source_end else max(event_times) + timedelta(hours=1)
     result = []
     for year, month in source_present_months(records, zone):
         start, end = calendar_month_bounds_utc(year, month, zone)
-        if all(hour in present for hour in expected_hourly_grid(start, end)): result.append((year, month))
+        if source_start <= start and end <= source_end:
+            result.append((year, month))
     return result
 
 def _interval(months, zone):
@@ -216,8 +222,10 @@ def select_primary_candidate_interval(months, zone, quality=None):
     candidates = []
     for period in consecutive_calendar_periods(months):
         for index in range(len(period) - 11):
-            window = period[index:index + 12]
-            if any(month == 11 for _, month in window): candidates.append(_interval(window, zone))
+            candidate = _interval(period[index:index + 12], zone)
+            years = range(candidate.start_local.year - 1, candidate.end_local.year + 1)
+            if any(candidate.start_utc <= winter_window_utc(year, zone).start_utc and winter_window_utc(year, zone).end_utc <= candidate.end_utc for year in years):
+                candidates.append(candidate)
     return max(candidates, key=lambda c: c.start_utc) if candidates else None
 
 def legitimate_candidate_intervals(records, zone):
@@ -323,3 +331,46 @@ def evaluate_stage0_gates(structural, numeric):
     if len(failed) != 1: return Stage0GateEvaluation(False, False)
     value, threshold = values[failed[0]], thresholds[failed[0]]
     return Stage0GateEvaluation(False, value is not None and value >= threshold - 5)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("discovery")
+    coverage_parser = subparsers.add_parser("coverage")
+    coverage_parser.add_argument("--sensor-id", required=True, type=int)
+    args = parser.parse_args(argv)
+    import os
+    from pathlib import Path
+
+    import httpx
+    from scripts import openaq
+
+    api_key = os.environ.get("OPENAQ_API_KEY")
+    if not api_key:
+        parser.error("OPENAQ_API_KEY is required")
+    artifact_directory = Path(".artifacts/data_spike")
+    raw_directory = artifact_directory / "raw/openaq"
+    discovery_path = artifact_directory / "openaq_discovery.json"
+    with httpx.Client(timeout=30) as client:
+        if args.command == "discovery":
+            discovered = openaq.discover(client, api_key, raw_directory)
+            artifact_directory.mkdir(parents=True, exist_ok=True)
+            discovery_path.write_text(json.dumps(discovered, indent=2, sort_keys=True) + "\n")
+            return
+        discovered = openaq.discover(client, api_key, raw_directory)
+        sensor = next((item for item in discovered if item["sensor_id"] == args.sensor_id), None)
+        if sensor is None:
+            raise openaq.OpenAQError(f"Sensor {args.sensor_id} not found in Hanoi discovery")
+        records, provenance = [], []
+        for chunk_start, chunk_end in openaq.sensor_history_chunks(sensor):
+            rows, pages = openaq.fetch_hours(client, api_key, args.sensor_id, chunk_start, chunk_end, raw_directory)
+            records.extend(rows)
+            provenance.extend(pages)
+    artifact_directory.mkdir(parents=True, exist_ok=True)
+    (artifact_directory / "openaq_provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+    openaq.write_coverage_report(records, artifact_directory / "coverage")
+
+
+if __name__ == "__main__":
+    main()
