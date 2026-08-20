@@ -70,6 +70,21 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(openmeteo.OpenMeteoError, "coordinates"):
             openmeteo.load_pm25_artifact(artifact(coordinates={"latitude": 1, "longitude": 2}), 13502151)
 
+    def test_real_sensor_metadata_coordinate_shape_accepts_float_representation_noise(self):
+        data = artifact(coordinates={"latitude": 21.0031, "longitude": 105.79470000000002})
+        loaded = openmeteo.load_pm25_artifact(data, 13502151)
+        self.assertEqual(loaded.sensor_id, 13502151)
+
+    def test_genuinely_different_longitude_fails(self):
+        data = artifact(coordinates={"latitude": 21.0031, "longitude": 105.7957})
+        with self.assertRaisesRegex(openmeteo.OpenMeteoError, "coordinates"):
+            openmeteo.load_pm25_artifact(data, 13502151)
+
+    def test_genuinely_different_latitude_fails(self):
+        data = artifact(coordinates={"latitude": 21.0041, "longitude": 105.7947})
+        with self.assertRaisesRegex(openmeteo.OpenMeteoError, "coordinates"):
+            openmeteo.load_pm25_artifact(data, 13502151)
+
     def test_duplicate_resolution_yields_unique_valid_hours_inside_half_open_interval(self):
         data = artifact()
         data["normalized_records"] += [

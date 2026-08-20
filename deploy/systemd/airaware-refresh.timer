@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh AirAware VN PM2.5 hourly
+
+[Timer]
+OnCalendar=*-*-* *:12:00
+Persistent=true
+AccuracySec=1min
+Unit=airaware-refresh.service
+
+[Install]
+WantedBy=timers.target

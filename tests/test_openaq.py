@@ -4,13 +4,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import io
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
 
-from scripts import openaq
+from scripts import openaq, openmeteo
 
 
 UTC = timezone.utc
@@ -141,6 +142,38 @@ class FetchTests(unittest.TestCase):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_sensor_metadata_enriches_compact_discovery_sensor_for_arbitrary_id(self):
+        compact = {"sensor_id": 24680, "parameter_name": "pm25", "datetimeFirst": None, "datetimeLast": None}
+        authoritative = {"id": 24680, "datetimeFirst": {"utc": "2023-01-15T00:00:00Z"}, "datetimeLast": {"utc": "2023-03-02T00:00:00Z"}}
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return response([authoritative], 1)
+
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            enriched = openaq.enrich_sensor_metadata(client, "key", compact, Path(directory))
+
+        self.assertEqual(requests[0].url.path, "/v3/sensors/24680")
+        self.assertEqual(enriched["datetimeFirst"], authoritative["datetimeFirst"])
+        self.assertEqual(enriched["datetimeLast"], authoritative["datetimeLast"])
+        self.assertEqual(openaq.sensor_history_chunks(enriched)[0][0], datetime(2023, 1, 15, tzinfo=UTC))
+
+    def test_coverage_chunks_use_enriched_sensor_metadata(self):
+        compact = {"sensor_id": 86420, "datetimeFirst": None, "datetimeLast": None}
+        authoritative = {"id": 86420, "datetimeFirst": {"utc": "2024-04-10T00:00:00Z"}, "datetimeLast": {"utc": "2024-05-03T00:00:00Z"}}
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(lambda request: response([authoritative], 1))) as client:
+            chunks = openaq.sensor_history_chunks_for_coverage(client, "key", compact, Path(directory))
+        self.assertEqual(chunks[0][0], datetime(2024, 4, 10, tzinfo=UTC))
+        self.assertEqual(chunks[-1][1], datetime(2024, 5, 3, tzinfo=UTC))
+
+    def test_sensor_metadata_without_authoritative_history_bounds_is_explicit(self):
+        compact = {"sensor_id": 24680, "datetimeFirst": None, "datetimeLast": None}
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(lambda request: response([{"id": 24680}], 1))) as client:
+            enriched = openaq.enrich_sensor_metadata(client, "key", compact, Path(directory))
+        with self.assertRaisesRegex(openaq.OpenAQError, "lacks datetimeFirst or datetimeLast"):
+            openaq.sensor_history_chunks(enriched)
+
     def test_history_bounds_derive_from_sensor_metadata_and_chunks_are_hanoi_months(self):
         metadata = {"datetimeFirst": {"utc": "2023-01-15T00:00:00Z"}, "datetimeLast": {"utc": "2023-03-02T00:00:00Z"}}
         chunks = openaq.sensor_history_chunks(metadata)
@@ -163,6 +196,25 @@ class CoverageTests(unittest.TestCase):
         self.assertIn("usable_pm25_coverage_pct", report["coverage"])
         self.assertIn("longest_hours", report["gaps"])
         self.assertIn("overall_status", report)
+
+    def test_coverage_persists_weather_compatible_exact_normalized_records_and_formats_paths(self):
+        start = datetime(2022, 11, 1, tzinfo=openaq.HANOI).astimezone(UTC)
+        end = datetime(2023, 11, 1, tzinfo=openaq.HANOI).astimezone(UTC)
+        records = [{"sensor_id": 13502151, "event_time": start, "period_end_utc": start.replace(hour=18), "value": 10, "unit": "µg/m³", "record_id": 7}]
+        metadata = {"sensor_id": 13502151, "coordinates": {"latitude": 21.0031, "longitude": 105.7947}}
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = openaq.write_coverage_artifacts(records, metadata, Path(directory), source_start=start, source_end=end, output=output)
+            normalized = json.loads(paths["normalized_path"].read_text())
+            loaded = openmeteo.load_pm25_artifact(paths["normalized_path"], 13502151)
+        self.assertEqual(normalized["sensor_metadata"], metadata)
+        self.assertEqual(normalized["normalized_records"], [{**records[0], "event_time": start.isoformat(), "period_end_utc": start.replace(hour=18).isoformat()}])
+        self.assertEqual(normalized["normalized_records"][0]["event_time"], "2022-10-31T17:00:00+00:00")
+        self.assertEqual(normalized["frozen_candidate"], {"start_utc": start.isoformat(), "end_utc": start.replace(hour=18).isoformat()})
+        self.assertEqual(loaded.records[0]["event_time"], start)
+        for label in ("Sensor:", "Source date range:", "Frozen candidate:", "Expected hours:", "Observed hours:", "Valid PM2.5 hours:", "Timestamp completeness:", "Usable PM2.5 coverage:", "Winter completeness:", "Winter usable coverage:", "Longest gap:", "PM2.5 gate:", "Normalized artifact path:", "Coverage artifact path:"):
+            self.assertIn(label, output.getvalue())
+        self.assertIn(str(paths["normalized_path"]), output.getvalue())
 
     def test_winter_reports_percentages_and_explicit_status(self):
         start = datetime(2022, 11, 1, tzinfo=openaq.HANOI).astimezone(UTC)

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AirAware VN</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; background: #f4f7f5; color: #17211c; }
+    body { margin: 0; }
+    main { width: min(44rem, calc(100% - 2rem)); margin: 0 auto; padding: 3rem 0; }
+    header { border-bottom: 1px solid #cbd7d0; padding-bottom: 1.5rem; }
+    h1 { margin: 0; font-size: 2rem; }
+    .mode { color: #4b6155; margin: .5rem 0 0; }
+    .status { min-height: 1.5rem; margin: 1.5rem 0; }
+    .readings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    section { background: #fff; border: 1px solid #cbd7d0; padding: 1.25rem; }
+    h2 { margin: 0 0 .5rem; font-size: 1rem; color: #4b6155; }
+    .value { margin: 0; font-size: 2rem; font-weight: 700; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: .75rem 1rem; margin: 1rem 0 0; }
+    dt { color: #4b6155; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    button { margin-top: 1.5rem; border: 0; background: #176b45; color: white; padding: .75rem 1rem; font: inherit; font-weight: 700; cursor: pointer; }
+    button:focus-visible { outline: 3px solid #17211c; outline-offset: 3px; }
+    button:disabled { cursor: wait; opacity: .65; }
+    @media (max-width: 32rem) { .readings { grid-template-columns: 1fr; } dl { grid-template-columns: 1fr; gap: .25rem; } dd { margin-bottom: .5rem; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>AirAware VN</h1>
+      <p class="mode">Fresh OpenAQ data when available. Historical artifact remains explicit fallback.</p>
+    </header>
+    <p id="status" class="status" role="status" aria-live="polite">Loading forecast…</p>
+    <div id="forecast" hidden>
+      <div class="readings">
+        <section>
+          <h2>Latest completed PM2.5</h2>
+          <p class="value"><span id="latest-pm25"></span> <small>µg/m³</small></p>
+        </section>
+        <section>
+          <h2>V1 predicted PM2.5</h2>
+          <p class="value"><span id="predicted-pm25"></span> <small>µg/m³</small></p>
+        </section>
+      </div>
+      <section>
+        <h2>Forecast details</h2>
+        <dl>
+          <dt>Prediction time</dt><dd id="prediction-time"></dd>
+          <dt>Target interval</dt><dd id="target-interval"></dd>
+          <dt>Forecast horizon</dt><dd>6 hours</dd>
+          <dt>Data mode</dt><dd id="data-mode"></dd>
+          <dt>Data freshness</dt><dd id="freshness"></dd>
+        </dl>
+      </section>
+    </div>
+    <button id="refresh" type="button">Refresh forecast</button>
+    <button id="historical" type="button">Use Historical artifact</button>
+  </main>
+  <script>
+    const status = document.querySelector("#status");
+    const forecast = document.querySelector("#forecast");
+    const refresh = document.querySelector("#refresh");
+    const historical = document.querySelector("#historical");
+    const formatTime = value => new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+
+    async function loadForecast(endpoint = "/forecast/current") {
+      refresh.disabled = true;
+      historical.disabled = true;
+      status.textContent = "Loading forecast…";
+      forecast.hidden = true;
+      try {
+        const response = await fetch(endpoint);
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || `Forecast unavailable (${response.status})`);
+        }
+        const data = await response.json();
+        document.querySelector("#latest-pm25").textContent = data.latest_completed_pm25.toFixed(1);
+        document.querySelector("#predicted-pm25").textContent = data.predicted_pm25.toFixed(1);
+        document.querySelector("#prediction-time").textContent = formatTime(data.prediction_time);
+        document.querySelector("#target-interval").textContent = `${formatTime(data.target_interval_start)} – ${formatTime(data.target_interval_end)}`;
+        const historicalMode = data.data_mode === "historical_artifact";
+        document.querySelector("#data-mode").textContent = historicalMode ? "Historical artifact" : "Fresh OpenAQ data";
+        document.querySelector("#freshness").textContent = historicalMode ? "Historical/offline" : `${data.freshness_status} (${data.age_minutes.toFixed(0)} minutes old)`;
+        status.textContent = historicalMode ? "Forecast loaded from Historical artifact." : `Forecast loaded from Fresh OpenAQ data. Status: ${data.freshness_status}.`;
+        forecast.hidden = false;
+      } catch (error) {
+        status.textContent = `Unable to load forecast: ${error.message}`;
+      } finally {
+        refresh.disabled = false;
+        historical.disabled = false;
+      }
+    }
+
+    refresh.addEventListener("click", () => loadForecast("/forecast/current"));
+    historical.addEventListener("click", () => loadForecast("/forecast/latest"));
+    loadForecast();
+  </script>
+</body>
+</html>

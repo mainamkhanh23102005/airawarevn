@@ -96,6 +96,22 @@ def discover(client, api_key, raw_directory, sleep=time.sleep, now=lambda: datet
     return discovered
 
 
+def enrich_sensor_metadata(client, api_key, metadata, raw_directory, sleep=time.sleep, now=lambda: datetime.now(UTC)):
+    sensor_id = metadata.get("sensor_id")
+    if sensor_id is None:
+        raise OpenAQError("Sensor metadata lacks sensor_id")
+    payload, _ = _request(client, api_key, f"/sensors/{sensor_id}", {}, raw_directory, sensor_id, sleep, now)
+    results = payload.get("results", [])
+    if not isinstance(results, list) or not results:
+        raise OpenAQError(f"Sensor {sensor_id} metadata not found")
+    authoritative = results[0]
+    return {**metadata, "datetimeFirst": authoritative.get("datetimeFirst"), "datetimeLast": authoritative.get("datetimeLast")}
+
+
+def sensor_history_chunks_for_coverage(client, api_key, metadata, raw_directory, sleep=time.sleep, now=lambda: datetime.now(UTC)):
+    return sensor_history_chunks(enrich_sensor_metadata(client, api_key, metadata, raw_directory, sleep, now))
+
+
 def normalize_measurement(row, sensor_id):
     period = row["period"]
     return {"sensor_id": sensor_id, "event_time": _parse_utc(period["datetimeFrom"]["utc"]), "period_end_utc": _parse_utc(period["datetimeTo"]["utc"]), "value": row.get("value"), "unit": row.get("parameter", {}).get("units"), "record_id": row.get("id")}
@@ -137,6 +153,41 @@ def sensor_history_chunks(metadata):
     if not first or not last:
         raise OpenAQError("Sensor metadata lacks datetimeFirst or datetimeLast")
     return hanoi_month_chunks(_parse_utc(first), _parse_utc(last))
+
+
+def write_coverage_artifacts(records, sensor_metadata, coverage_directory, source_start=None, source_end=None, output=None):
+    output = output or __import__("sys").stdout
+    coverage_path = write_coverage_report(records, coverage_directory, source_start, source_end)
+    report = json.loads(coverage_path.read_text())
+    frozen = report["frozen_candidate"] or {"start_utc": report["source_date_range"]["start_utc"], "end_utc": report["source_date_range"]["end_utc"]}
+    timestamp = frozen["start_utc"].replace(":", "").replace("-", "")
+    normalized_path = coverage_directory / f'openaq_normalized_sensor_{sensor_metadata["sensor_id"]}_{timestamp}.json'
+    normalized = {
+        "sensor_metadata": sensor_metadata,
+        "frozen_candidate": frozen,
+        "normalized_records": [
+            {**record, "event_time": record["event_time"].isoformat(), "period_end_utc": record["period_end_utc"].isoformat()}
+            for record in records
+        ],
+    }
+    normalized_path.write_text(json.dumps(normalized, indent=2, sort_keys=True) + "\n")
+    coverage = report["coverage"]
+    winter = report["winter"][0] if report["winter"] else None
+    print(f'Sensor: {sensor_metadata["sensor_id"]}', file=output)
+    print(f'Source date range: {report["source_date_range"]["start_utc"]} to {report["source_date_range"]["end_utc"]}', file=output)
+    print(f'Frozen candidate: {frozen["start_utc"]} to {frozen["end_utc"]}', file=output)
+    print(f'Expected hours: {coverage["expected_hours"]}', file=output)
+    print(f'Observed hours: {coverage["observed_unique_hours"]}', file=output)
+    print(f'Valid PM2.5 hours: {coverage["valid_pm25_hours"]}', file=output)
+    print(f'Timestamp completeness: {coverage["hourly_timestamp_completeness_pct"]}', file=output)
+    print(f'Usable PM2.5 coverage: {coverage["usable_pm25_coverage_pct"]}', file=output)
+    print(f'Winter completeness: {winter["hourly_timestamp_completeness_pct"] if winter else "undefined"}', file=output)
+    print(f'Winter usable coverage: {winter["usable_pm25_coverage_pct"] if winter else "undefined"}', file=output)
+    print(f'Longest gap: {report["gaps"]["longest_hours"]}', file=output)
+    print(f'PM2.5 gate: {report["numeric_pm25_gate"]["status"]}', file=output)
+    print(f'Normalized artifact path: {normalized_path}', file=output)
+    print(f'Coverage artifact path: {coverage_path}', file=output)
+    return {"normalized_path": normalized_path, "coverage_path": coverage_path}
 
 
 def write_coverage_report(records, coverage_directory, source_start=None, source_end=None):

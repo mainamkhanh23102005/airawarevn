@@ -84,7 +84,9 @@ def load_pm25_artifact(source, sensor_id):
     if sensor_id != TARGET_SENSOR_ID or not isinstance(metadata, dict) or metadata.get("sensor_id") != sensor_id:
         raise OpenMeteoError(f"Unsupported or mismatched sensor ID {sensor_id}")
     coordinates = metadata.get("coordinates")
-    if not isinstance(coordinates, dict) or coordinates.get("latitude") != TARGET_LATITUDE or coordinates.get("longitude") != TARGET_LONGITUDE:
+    latitude = coordinates.get("latitude") if isinstance(coordinates, dict) else None
+    longitude = coordinates.get("longitude") if isinstance(coordinates, dict) else None
+    if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)) or not math.isclose(latitude, TARGET_LATITUDE, rel_tol=0, abs_tol=1e-6) or not math.isclose(longitude, TARGET_LONGITUDE, rel_tol=0, abs_tol=1e-6):
         raise OpenMeteoError("Sensor coordinates do not match fixed target")
     rows = data.get("normalized_records")
     if not isinstance(rows, list):

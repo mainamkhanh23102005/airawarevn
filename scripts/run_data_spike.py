@@ -369,6 +369,7 @@ def main(argv=None):
         sensor = next((item for item in discovered if item["sensor_id"] == args.sensor_id), None)
         if sensor is None:
             raise openaq.OpenAQError(f"Sensor {args.sensor_id} not found in Hanoi discovery")
+        sensor = openaq.enrich_sensor_metadata(client, api_key, sensor, raw_directory)
         records, provenance = [], []
         for chunk_start, chunk_end in openaq.sensor_history_chunks(sensor):
             rows, pages = openaq.fetch_hours(client, api_key, args.sensor_id, chunk_start, chunk_end, raw_directory)
@@ -376,7 +377,7 @@ def main(argv=None):
             provenance.extend(pages)
     artifact_directory.mkdir(parents=True, exist_ok=True)
     (artifact_directory / "openaq_provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
-    openaq.write_coverage_report(records, artifact_directory / "coverage")
+    openaq.write_coverage_artifacts(records, sensor, artifact_directory / "coverage")
 
 
 if __name__ == "__main__":

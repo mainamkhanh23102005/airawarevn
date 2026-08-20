@@ -21,6 +21,8 @@ dist/
 
 # Stage 0 local evidence and artifacts
 .artifacts/data_spike/
+.artifacts/live/
+.artifacts/models/
 
 # OS and editor noise
 .DS_Store
