@@ -1,0 +1,18 @@
+[Unit]
+Description=Run AirAware VN FastAPI service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@
+EnvironmentFile=-%h/.config/airaware/airaware.env
+ExecStart=@REPO_ROOT@/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

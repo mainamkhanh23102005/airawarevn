@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 
-UNIT_NAMES = ("airaware-refresh.service", "airaware-refresh.timer")
+UNIT_NAMES = ("airaware-refresh.service", "airaware-refresh.timer", "airaware-api.service")
 
 
 def install_units(repository_root, destination):
@@ -35,6 +35,7 @@ def main(argv=None):
     print("Create ~/.config/airaware/airaware.env with mode 600, then run:")
     print("systemctl --user daemon-reload")
     print("systemctl --user enable --now airaware-refresh.timer")
+    print("systemctl --user enable --now airaware-api.service")
 
 
 if __name__ == "__main__":
