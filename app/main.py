@@ -99,6 +99,24 @@ class CurrentForecastResponse(LatestForecastResponse):
     age_minutes: float
 
 
+class StatusResponse(BaseModel):
+    overall_status: str
+    api_status: str
+    model_loaded: bool
+    model_type: str
+    model_version: str
+    forecast_horizon_hours: int
+    fresh_artifact_available: bool
+    freshness_status: str
+    source_retrieved_at: datetime | None = None
+    age_minutes: float | None = None
+    latest_completed_pm25: float | None = None
+    latest_completed_interval_end: datetime | None = None
+    sensor_id: int | None = None
+    current_forecast_available: bool
+    data_mode: str
+
+
 def _validate_metadata(metadata):
     expected = {
         "artifact_version": 1,
@@ -266,6 +284,15 @@ def _predict(model, metadata, payload):
     return predicted_pm25
 
 
+def _current_forecast_state(model, metadata, artifact_path, current_time):
+    artifact, retrieved_at = _load_current_artifact(artifact_path)
+    payload = _current_prediction_request(artifact, current_time)
+    predicted_pm25 = _predict(model, metadata, payload)
+    age_minutes = max(0.0, (current_time - payload.prediction_time).total_seconds() / 60)
+    is_stale = age_minutes > FRESHNESS_THRESHOLD_HOURS * 60
+    return artifact, retrieved_at, payload, predicted_pm25, age_minutes, is_stale
+
+
 def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_path=None, now=lambda: datetime.now(timezone.utc)):
     configured_path = Path(
         model_path or os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH)
@@ -367,16 +394,16 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
     def current_forecast(request: Request):
         current_time = now().astimezone(timezone.utc)
         try:
-            artifact, retrieved_at = _load_current_artifact(request.app.state.current_pm25_artifact_path)
-            payload = _current_prediction_request(artifact, current_time)
-            predicted_pm25 = _predict(request.app.state.model, request.app.state.metadata, payload)
+            artifact, retrieved_at, payload, predicted_pm25, age_minutes, is_stale = _current_forecast_state(
+                request.app.state.model,
+                request.app.state.metadata,
+                request.app.state.current_pm25_artifact_path,
+                current_time,
+            )
         except OpenMeteoError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-
-        age_minutes = max(0.0, (current_time - payload.prediction_time).total_seconds() / 60)
-        is_stale = age_minutes > FRESHNESS_THRESHOLD_HOURS * 60
         target_start = payload.prediction_time + timedelta(hours=FORECAST_HORIZON_HOURS)
         return CurrentForecastResponse(
             prediction_time=payload.prediction_time,
@@ -394,6 +421,57 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
             sensor_id=artifact["sensor_id"],
             freshness_status="stale" if is_stale else "fresh",
             age_minutes=age_minutes,
+        )
+
+    @application.get("/status", response_model=StatusResponse)
+    def status(request: Request):
+        current_time = now().astimezone(timezone.utc)
+        base = {
+            "api_status": "ok",
+            "model_loaded": True,
+            "model_type": MODEL_TYPE.rsplit(".", 1)[-1],
+            "model_version": MODEL_VERSION,
+            "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
+        }
+        try:
+            artifact, retrieved_at = _load_current_artifact(request.app.state.current_pm25_artifact_path)
+        except (OpenMeteoError, ValueError, TypeError, KeyError):
+            return StatusResponse(
+                **base,
+                overall_status="degraded",
+                fresh_artifact_available=False,
+                freshness_status="unavailable",
+                current_forecast_available=False,
+                data_mode="unavailable",
+            )
+        try:
+            payload = _current_prediction_request(artifact, current_time)
+            _predict(request.app.state.model, request.app.state.metadata, payload)
+            age_minutes = max(0.0, (current_time - payload.prediction_time).total_seconds() / 60)
+            is_stale = age_minutes > FRESHNESS_THRESHOLD_HOURS * 60
+        except (OpenMeteoError, ValueError, TypeError, KeyError):
+            return StatusResponse(
+                **base,
+                overall_status="degraded",
+                fresh_artifact_available=True,
+                freshness_status="unavailable",
+                source_retrieved_at=retrieved_at,
+                sensor_id=artifact.get("sensor_id"),
+                current_forecast_available=False,
+                data_mode="unavailable",
+            )
+        return StatusResponse(
+            **base,
+            overall_status="degraded" if is_stale else "healthy",
+            fresh_artifact_available=True,
+            freshness_status="stale" if is_stale else "fresh",
+            source_retrieved_at=retrieved_at,
+            age_minutes=age_minutes,
+            latest_completed_pm25=payload.history[-1].pm25,
+            latest_completed_interval_end=payload.prediction_time,
+            sensor_id=artifact["sensor_id"],
+            current_forecast_available=True,
+            data_mode="stale_openaq" if is_stale else "fresh_openaq",
         )
 
     return application

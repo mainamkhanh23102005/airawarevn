@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import joblib
 import pandas as pd
@@ -403,6 +404,76 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data_mode"], "historical_artifact")
 
+    def test_status_reports_healthy_current_forecast_state(self):
+        self.write_current_pm25_artifact()
+        with self.client(now=lambda: self.prediction_time) as client:
+            response = client.get("/status")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["overall_status"], "healthy")
+        self.assertEqual(body["api_status"], "ok")
+        self.assertTrue(body["model_loaded"])
+        self.assertEqual(body["model_type"], "LinearRegression")
+        self.assertEqual(body["model_version"], "v1")
+        self.assertEqual(body["forecast_horizon_hours"], 6)
+        self.assertTrue(body["fresh_artifact_available"])
+        self.assertEqual(body["freshness_status"], "fresh")
+        self.assertEqual(datetime.fromisoformat(body["source_retrieved_at"]), self.prediction_time)
+        self.assertEqual(body["age_minutes"], 0.0)
+        self.assertEqual(body["latest_completed_pm25"], 24.0)
+        self.assertEqual(datetime.fromisoformat(body["latest_completed_interval_end"]), self.prediction_time)
+        self.assertEqual(body["sensor_id"], 13502151)
+        self.assertTrue(body["current_forecast_available"])
+        self.assertEqual(body["data_mode"], "fresh_openaq")
+
+    def test_status_reports_stale_artifact_as_degraded(self):
+        self.write_current_pm25_artifact()
+        with self.client(now=lambda: self.prediction_time + timedelta(hours=4, minutes=1)) as client:
+            body = client.get("/status").json()
+        self.assertEqual(body["overall_status"], "degraded")
+        self.assertEqual(body["freshness_status"], "stale")
+        self.assertTrue(body["current_forecast_available"])
+        self.assertEqual(body["data_mode"], "stale_openaq")
+
+    def test_status_reports_missing_and_corrupt_artifact_without_path_leakage(self):
+        cases = ("missing", "corrupt")
+        for case in cases:
+            with self.subTest(case=case):
+                if case == "corrupt":
+                    self.current_pm25_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.current_pm25_artifact_path.write_text("not json", encoding="utf-8")
+                with self.client(now=lambda: self.prediction_time) as client:
+                    response = client.get("/status")
+                body = response.json()
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(body["overall_status"], "degraded")
+                self.assertFalse(body["fresh_artifact_available"])
+                self.assertFalse(body["current_forecast_available"])
+                self.assertEqual(body["freshness_status"], "unavailable")
+                serialized = json.dumps(body)
+                self.assertNotIn(str(self.current_pm25_artifact_path), serialized)
+                self.assertNotIn("OPENAQ_API_KEY", serialized)
+                self.current_pm25_artifact_path.unlink(missing_ok=True)
+
+    def test_status_reports_insufficient_history_as_degraded(self):
+        self.write_current_pm25_artifact(self.history[1:])
+        with self.client(now=lambda: self.prediction_time) as client:
+            body = client.get("/status").json()
+        self.assertEqual(body["overall_status"], "degraded")
+        self.assertTrue(body["fresh_artifact_available"])
+        self.assertFalse(body["current_forecast_available"])
+        self.assertEqual(body["freshness_status"], "unavailable")
+
+    def test_status_reports_forecast_failure_without_internal_error(self):
+        self.write_current_pm25_artifact()
+        with patch("app.main._predict", side_effect=ValueError("sensitive internal failure")):
+            with self.client(now=lambda: self.prediction_time) as client:
+                body = client.get("/status").json()
+        self.assertEqual(body["overall_status"], "degraded")
+        self.assertFalse(body["current_forecast_available"])
+        self.assertNotIn("sensitive internal failure", json.dumps(body))
+
     def test_webpage_distinguishes_current_and_historical_forecasts(self):
         with self.client() as client:
             response = client.get("/")
@@ -410,6 +481,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/html"))
         self.assertIn("AirAware VN", response.text)
+        self.assertIn("/status", response.text)
+        self.assertIn("AirAware status", response.text)
+        self.assertIn("OpenAQ data", response.text)
+        self.assertIn("Last retrieval", response.text)
         self.assertIn("/forecast/current", response.text)
         self.assertIn("/forecast/latest", response.text)
         self.assertIn("Fresh OpenAQ data", response.text)

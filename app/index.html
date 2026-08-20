@@ -31,6 +31,17 @@
       <h1>AirAware VN</h1>
       <p class="mode">Fresh OpenAQ data when available. Historical artifact remains explicit fallback.</p>
     </header>
+    <section aria-labelledby="operational-status-title">
+      <h2 id="operational-status-title">AirAware status</h2>
+      <dl>
+        <dt>AirAware</dt><dd id="airaware-status">Loading…</dd>
+        <dt>OpenAQ data</dt><dd id="openaq-status">Loading…</dd>
+        <dt>Last retrieval</dt><dd id="last-retrieval">Unavailable</dd>
+        <dt>Data age</dt><dd id="data-age">Unavailable</dd>
+        <dt>Model</dt><dd id="model-status">V1 Linear Regression</dd>
+        <dt>Forecast horizon</dt><dd id="status-horizon">6 hours</dd>
+      </dl>
+    </section>
     <p id="status" class="status" role="status" aria-live="polite">Loading forecast…</p>
     <div id="forecast" hidden>
       <div class="readings">
@@ -64,6 +75,23 @@
     const historical = document.querySelector("#historical");
     const formatTime = value => new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 
+    async function loadStatus() {
+      try {
+        const response = await fetch("/status");
+        if (!response.ok) throw new Error(`Status unavailable (${response.status})`);
+        const data = await response.json();
+        document.querySelector("#airaware-status").textContent = data.overall_status;
+        document.querySelector("#openaq-status").textContent = data.freshness_status;
+        document.querySelector("#last-retrieval").textContent = data.source_retrieved_at ? formatTime(data.source_retrieved_at) : "Unavailable";
+        document.querySelector("#data-age").textContent = data.age_minutes === null ? "Unavailable" : `${data.age_minutes.toFixed(0)} minutes`;
+        document.querySelector("#model-status").textContent = `${data.model_version.toUpperCase()} ${data.model_type}`;
+        document.querySelector("#status-horizon").textContent = `${data.forecast_horizon_hours} hours`;
+      } catch (error) {
+        document.querySelector("#airaware-status").textContent = "Unavailable";
+        document.querySelector("#openaq-status").textContent = "Unavailable";
+      }
+    }
+
     async function loadForecast(endpoint = "/forecast/current") {
       refresh.disabled = true;
       historical.disabled = true;
@@ -91,10 +119,12 @@
         refresh.disabled = false;
         historical.disabled = false;
       }
+      loadStatus();
     }
 
     refresh.addEventListener("click", () => loadForecast("/forecast/current"));
     historical.addEventListener("click", () => loadForecast("/forecast/latest"));
+    loadStatus();
     loadForecast();
   </script>
 </body>
