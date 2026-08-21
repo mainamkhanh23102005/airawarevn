@@ -29,7 +29,7 @@
   <main>
     <header>
       <h1>AirAware VN</h1>
-      <p class="mode">Fresh OpenAQ data when available. Historical artifact remains explicit fallback.</p>
+      <p class="mode">Live 6-hour PM2.5 forecast from OpenAQ observations.</p>
     </header>
     <section aria-labelledby="operational-status-title">
       <h2 id="operational-status-title">AirAware status</h2>
@@ -43,7 +43,7 @@
       </dl>
     </section>
     <p id="status" class="status" role="status" aria-live="polite">Loading forecast…</p>
-    <div id="forecast" hidden>
+    <div id="forecast" aria-busy="true" hidden>
       <div class="readings">
         <section>
           <h2>Latest completed PM2.5</h2>
@@ -65,14 +65,12 @@
         </dl>
       </section>
     </div>
-    <button id="refresh" type="button">Refresh forecast</button>
-    <button id="historical" type="button">Use Historical artifact</button>
+    <button id="refresh" type="button">Refresh live forecast</button>
   </main>
   <script>
     const status = document.querySelector("#status");
     const forecast = document.querySelector("#forecast");
     const refresh = document.querySelector("#refresh");
-    const historical = document.querySelector("#historical");
     const formatTime = value => new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 
     async function loadStatus() {
@@ -94,38 +92,37 @@
 
     async function loadForecast(endpoint = "/forecast/current") {
       refresh.disabled = true;
-      historical.disabled = true;
-      status.textContent = "Loading forecast…";
-      forecast.hidden = true;
+      forecast.setAttribute("aria-busy", "true");
+      status.textContent = forecast.hidden ? "Loading live forecast…" : "Refreshing live forecast…";
       try {
         const response = await fetch(endpoint);
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({}));
-          throw new Error(body.detail || `Forecast unavailable (${response.status})`);
-        }
+        if (!response.ok) throw new Error(`Forecast unavailable (${response.status})`);
         const data = await response.json();
         document.querySelector("#latest-pm25").textContent = data.latest_completed_pm25.toFixed(1);
         document.querySelector("#predicted-pm25").textContent = data.predicted_pm25.toFixed(1);
         document.querySelector("#prediction-time").textContent = formatTime(data.prediction_time);
         document.querySelector("#target-interval").textContent = `${formatTime(data.target_interval_start)} – ${formatTime(data.target_interval_end)}`;
-        const historicalMode = data.data_mode === "historical_artifact";
-        document.querySelector("#data-mode").textContent = historicalMode ? "Historical artifact" : "Fresh OpenAQ data";
-        document.querySelector("#freshness").textContent = historicalMode ? "Historical/offline" : `${data.freshness_status} (${data.age_minutes.toFixed(0)} minutes old)`;
-        status.textContent = historicalMode ? "Forecast loaded from Historical artifact." : `Forecast loaded from Fresh OpenAQ data. Status: ${data.freshness_status}.`;
+        const modeLabels = {
+          fresh_openaq: "Fresh OpenAQ data",
+          stale_openaq: "Stale OpenAQ data",
+        };
+        const modeLabel = modeLabels[data.data_mode] || "Live OpenAQ data";
+        document.querySelector("#data-mode").textContent = modeLabel;
+        document.querySelector("#freshness").textContent = `${data.freshness_status} (${data.age_minutes.toFixed(0)} minutes old)`;
+        status.textContent = `Live forecast loaded from ${modeLabel}. Status: ${data.freshness_status}.`;
         forecast.hidden = false;
       } catch (error) {
-        status.textContent = `Unable to load forecast: ${error.message}`;
+        forecast.hidden = true;
+        status.textContent = "Live forecast unavailable. Previous readings hidden. Try refreshing shortly.";
       } finally {
         refresh.disabled = false;
-        historical.disabled = false;
+        forecast.setAttribute("aria-busy", "false");
+        await loadStatus();
       }
-      loadStatus();
     }
 
     refresh.addEventListener("click", () => loadForecast("/forecast/current"));
-    historical.addEventListener("click", () => loadForecast("/forecast/latest"));
-    loadStatus();
-    loadForecast();
+    loadForecast("/forecast/current");
   </script>
 </body>
 </html>

@@ -42,6 +42,9 @@ DEFAULT_PM25_ARTIFACT_PATH = (
 DEFAULT_CURRENT_PM25_ARTIFACT_PATH = REPOSITORY_ROOT / ".artifacts" / "live" / "current_pm25.json"
 FRESHNESS_THRESHOLD_HOURS = 4
 INDEX_PATH = Path(__file__).with_name("index.html")
+INVALID_PREDICTION_DETAIL = "Prediction input is invalid."
+FORECAST_SOURCE_UNAVAILABLE_DETAIL = "Forecast source is unavailable."
+FORECAST_DATA_INVALID_DETAIL = "Forecast data is invalid."
 
 
 class Pm25Observation(BaseModel):
@@ -383,7 +386,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 payload,
             )
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=INVALID_PREDICTION_DETAIL) from error
 
         target_start = payload.prediction_time + timedelta(
             hours=FORECAST_HORIZON_HOURS
@@ -412,9 +415,9 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 payload,
             )
         except OpenMeteoError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=FORECAST_DATA_INVALID_DETAIL) from error
 
         target_start = payload.prediction_time + timedelta(
             hours=FORECAST_HORIZON_HOURS
@@ -444,9 +447,9 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 current_time,
             )
         except OpenMeteoError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=FORECAST_DATA_INVALID_DETAIL) from error
         target_start = payload.prediction_time + timedelta(hours=FORECAST_HORIZON_HOURS)
         return CurrentForecastResponse(
             prediction_time=payload.prediction_time,

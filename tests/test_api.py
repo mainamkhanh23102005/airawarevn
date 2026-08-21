@@ -339,7 +339,7 @@ class ApiTests(unittest.TestCase):
             response = client.get("/forecast/latest")
 
         self.assertEqual(response.status_code, 422)
-        self.assertIn("no contiguous 24-hour", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "Forecast data is invalid.")
 
     def test_current_forecast_uses_exactly_24_completed_hours_and_existing_pipeline(self):
         self.write_current_pm25_artifact()
@@ -366,7 +366,7 @@ class ApiTests(unittest.TestCase):
         with self.client(now=lambda: self.prediction_time) as client:
             response = client.get("/forecast/current")
         self.assertEqual(response.status_code, 422)
-        self.assertIn("contiguous", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "Forecast data is invalid.")
 
     def test_current_forecast_rejects_incomplete_current_interval(self):
         incomplete = self.history[:-1] + [{"event_time": self.prediction_time.isoformat(), "pm25": 999999.0}]
@@ -374,7 +374,7 @@ class ApiTests(unittest.TestCase):
         with self.client(now=lambda: self.prediction_time + timedelta(minutes=30)) as client:
             response = client.get("/forecast/current")
         self.assertEqual(response.status_code, 422)
-        self.assertIn("contiguous", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "Forecast data is invalid.")
 
     def test_current_forecast_rejects_conflicting_duplicate_timestamp(self):
         duplicate = self.history + [{**self.history[-1], "pm25": 999.0}]
@@ -382,7 +382,7 @@ class ApiTests(unittest.TestCase):
         with self.client(now=lambda: self.prediction_time) as client:
             response = client.get("/forecast/current")
         self.assertEqual(response.status_code, 422)
-        self.assertIn("contiguous", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "Forecast data is invalid.")
 
     def test_current_forecast_identifies_stale_artifact(self):
         self.write_current_pm25_artifact()
@@ -398,7 +398,33 @@ class ApiTests(unittest.TestCase):
         with self.client(now=lambda: self.prediction_time) as client:
             response = client.get("/forecast/current")
         self.assertEqual(response.status_code, 503)
-        self.assertIn("fresh PM2.5 artifact", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "Forecast source is unavailable.")
+
+    def test_forecast_errors_do_not_expose_internal_details(self):
+        sentinel = "/srv/private/OPENAQ_API_KEY=secret/traceback.json"
+        cases = (
+            ("/forecast/latest", "app.main.load_pm25_artifact", main.OpenMeteoError(sentinel), 503, "Forecast source is unavailable."),
+            ("/forecast/latest", "app.main.load_pm25_artifact", ValueError(sentinel), 422, "Forecast data is invalid."),
+            ("/forecast/current", "app.main._current_forecast_state", main.OpenMeteoError(sentinel), 503, "Forecast source is unavailable."),
+            ("/forecast/current", "app.main._current_forecast_state", ValueError(sentinel), 422, "Forecast data is invalid."),
+        )
+        for route, target, error, status_code, detail in cases:
+            with self.subTest(route=route, error=type(error).__name__), patch(target, side_effect=error):
+                with self.client(now=lambda: self.prediction_time) as client:
+                    response = client.get(route)
+            self.assertEqual(response.status_code, status_code)
+            self.assertEqual(response.json()["detail"], detail)
+            self.assertNotIn(sentinel, response.text)
+            self.assertNotIn("OPENAQ_API_KEY", response.text)
+
+    def test_predict_error_does_not_expose_internal_details(self):
+        sentinel = "/srv/private/model.joblib: internal coefficient failure"
+        with patch("app.main._predict", side_effect=ValueError(sentinel)):
+            with self.client() as client:
+                response = client.post("/predict", json=self.payload())
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"], "Prediction input is invalid.")
+        self.assertNotIn(sentinel, response.text)
 
     def test_historical_forecast_still_works_with_current_route(self):
         with self.client(now=lambda: self.prediction_time) as client:
@@ -476,7 +502,7 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(body["current_forecast_available"])
         self.assertNotIn("sensitive internal failure", json.dumps(body))
 
-    def test_webpage_distinguishes_current_and_historical_forecasts(self):
+    def test_webpage_uses_live_forecast_without_historical_fallback(self):
         with self.client() as client:
             response = client.get("/")
 
@@ -487,10 +513,15 @@ class ApiTests(unittest.TestCase):
         self.assertIn("AirAware status", response.text)
         self.assertIn("OpenAQ data", response.text)
         self.assertIn("Last retrieval", response.text)
-        self.assertIn("/forecast/current", response.text)
-        self.assertIn("/forecast/latest", response.text)
+        self.assertIn('loadForecast("/forecast/current")', response.text)
+        self.assertNotIn('loadForecast("/forecast/latest")', response.text)
         self.assertIn("Fresh OpenAQ data", response.text)
-        self.assertIn("Historical artifact", response.text)
+        self.assertIn("Stale OpenAQ data", response.text)
+        self.assertIn('aria-busy="true"', response.text)
+        self.assertIn("forecast.hidden = true", response.text)
+        self.assertIn("Previous readings hidden", response.text)
+        self.assertNotIn("body.detail", response.text)
+        self.assertNotIn("error.message", response.text)
 
     def test_missing_or_corrupt_artifact_fails_during_startup(self):
         missing_path = Path(self.directory.name) / "missing.joblib"
