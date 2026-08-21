@@ -151,7 +151,16 @@ source .venv/bin/activate
 pip install -r requirements-stage0.txt
 ```
 
-Model and historical artifacts are intentionally stored under ignored `.artifacts/` paths. A working deployment needs the saved V1 model artifact expected by `app.main`, or an `AIRAWARE_MODEL_PATH` override. The repository currently exposes reusable training and serialization functions, and the offline experiment reproduces evaluation, but no supported clean CLI rebuilds the frozen production model artifact from a fresh clone. Producing and promoting that artifact through the existing offline workflow is a known reproducibility gap reserved for a later engineering task.
+Model and historical artifacts are intentionally stored under ignored `.artifacts/` paths. A working deployment needs the saved V1 model artifact expected by `app.main`, or an `AIRAWARE_MODEL_PATH` override. The repository now includes a supported offline training CLI that trains an artifact conforming to the frozen V1 contract from a frozen OpenAQ normalized PM2.5 artifact:
+
+```bash
+python -m scripts.modeling.train_cli --help
+python -m scripts.modeling.train_cli \
+  --input .artifacts/data_spike/coverage/openaq_normalized_sensor_13502151_20250731T170000+0000.json \
+  --output .artifacts/models/airaware_v1.joblib
+```
+
+The CLI uses the same V1 feature builder, target, and `LinearRegression` contract as the API, and it refuses to overwrite an existing output unless `--force` is passed. The frozen OpenAQ normalized artifact is a prerequisite; it is not committed and must be produced by the data-spike workflow or supplied as an override.
 
 ### 2. Configure OpenAQ securely
 
@@ -224,7 +233,7 @@ python -m unittest discover -s tests
 python -m compileall -q app scripts tests
 ```
 
-Current verified state: **123 passing tests**, with external OpenAQ calls mocked in unit tests.
+Current verified state: **136 passing tests**, with external OpenAQ calls mocked in unit tests.
 
 ## Repository structure
 
