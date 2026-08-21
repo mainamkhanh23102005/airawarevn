@@ -14,7 +14,7 @@ The web application displays:
 - fresh, stale, unavailable, or explicitly historical data state;
 - model and operational status.
 
-The current forecast never silently falls back to historical data. Historical output remains available as a clearly labeled offline fallback.
+The current forecast never silently falls back to historical data. Historical output remains available as a clearly labeled offline fallback when its separate frozen input artifact is provisioned; a fresh Render clone does not include that ignored artifact.
 
 > **Public demo:** a temporary Cloudflare Quick Tunnel may be available during active development. Its random URL is not permanent hosting; stable deployment is planned.
 
@@ -32,14 +32,14 @@ flowchart LR
   end
 
   subgraph live["LIVE INFERENCE PATH"]
-    T["systemd refresh timer<br/>hourly at HH:12"] --> R["scripts.refresh_pm25"]
+    T["Refresh trigger<br/>systemd timer or managed web loop"] --> R["scripts.refresh_pm25"]
     OA["OpenAQ API"] --> R
     R --> A[".artifacts/live/current_pm25.json"]
     A --> C["24 completed contiguous hours"]
     C --> FB2["Same V1 feature builder"]
     M --> P["V1 prediction"]
     FB2 --> P
-    P --> API["FastAPI<br/>systemd API service"]
+    P --> API["FastAPI<br/>systemd or Render web service"]
     API --> UI["FastAPI-served HTML/JS UI"]
     API --> H["GET /health"]
     API --> S["GET /status"]
@@ -119,7 +119,7 @@ V1 therefore excludes weather by design. A weather-enabled V2 should ingest prod
 
 ## Fresh inference and API
 
-Every hour, the user-level systemd timer runs:
+For local user-level systemd deployment, the hourly refresh path is:
 
 ```text
 airaware-refresh.timer
@@ -136,7 +136,7 @@ The API loads the saved V1 model once at startup. `/forecast/current` reads the 
 | `GET /health` | Cheap API/model liveness check |
 | `GET /status` | Model, artifact, freshness, and current-forecast state |
 | `GET /forecast/current` | Fresh or explicitly stale OpenAQ-based forecast |
-| `GET /forecast/latest` | Historical/offline artifact fallback |
+| `GET /forecast/latest` | Historical/offline fallback; returns 503 unless its separate frozen artifact is provisioned |
 | `POST /predict` | Low-level prediction contract for exactly 24 hourly observations |
 
 ## Run locally
@@ -198,6 +198,22 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 Open <http://127.0.0.1:8000>.
 
+## Render deployment
+
+`render.yaml` runs one Uvicorn web service on Render's `PORT` and binds to `0.0.0.0`. `scripts.start_render` requires a trusted, versioned model artifact: it uses an existing `AIRAWARE_MODEL_PATH`, or downloads `AIRAWARE_MODEL_URL` with a 30-second timeout, a 50 MiB limit, and mandatory `AIRAWARE_MODEL_SHA256` verification before startup. Keep model URL and digest in Render environment variables; never put credentials in URL or repository.
+
+A fresh clone cannot build the model: both saved model and frozen training input are intentionally ignored. Train offline with the same scikit-learn version used for serving, publish resulting immutable `airaware_v1.joblib` to trusted storage, and configure URL and SHA-256. Render startup never fabricates or retrains model. `/forecast/latest` additionally needs the ignored frozen normalized PM2.5 input supplied through `AIRAWARE_PM25_ARTIFACT_PATH`; without it, that optional historical endpoint returns 503.
+
+Required Render variables:
+
+```text
+AIRAWARE_MODEL_URL=https://trusted-storage.example/airaware_v1.joblib
+AIRAWARE_MODEL_SHA256=<64-character-sha256>
+OPENAQ_API_KEY=<secret>
+```
+
+`OPENAQ_API_KEY` remains environment-only. `AIRAWARE_REFRESH_ENABLED=1` starts one bounded in-process refresh loop in web service: refresh runs immediately on startup and, while service remains active, hourly; failures preserve last good artifact and next scheduled attempt still runs. Render free spin-down suspends process and hourly cadence until next request wakes service. Keep one Uvicorn worker; multiple workers would duplicate OpenAQ requests. Current V1 live data is local JSON, so Render's ephemeral filesystem loses it on restart, causing immediate re-fetch, and separate Render cron services cannot share it with web service. Durable history or horizontal scaling requires shared object storage or database. Local systemd behavior remains unchanged because managed refresh is opt-in.
+
 ## User-level systemd operation
 
 Repository-managed templates live in `deploy/systemd/`. Install rendered user units with:
@@ -233,7 +249,7 @@ python -m unittest discover -s tests
 python -m compileall -q app scripts tests
 ```
 
-Current verified state: **136 passing tests**, with external OpenAQ calls mocked in unit tests.
+Current verified state: **141 passing tests**, with external OpenAQ calls mocked in unit tests.
 
 ## Repository structure
 

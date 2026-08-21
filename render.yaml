@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: airaware-vn
+    runtime: python
+    buildCommand: pip install -r requirements-stage0.txt
+    startCommand: python -m scripts.start_render
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: AIRAWARE_REFRESH_ENABLED
+        value: "1"
+      - key: OPENAQ_API_KEY
+        sync: false
+      - key: AIRAWARE_MODEL_URL
+        sync: false
+      - key: AIRAWARE_MODEL_SHA256
+        sync: false

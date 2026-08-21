@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import tempfile
@@ -10,6 +11,7 @@ import joblib
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from app import main
 from app.main import create_app
 from scripts.modeling.features import V1_FEATURE_COLUMNS, build_v1_features
 from scripts.modeling.predict import predict_pm25_t_plus_6
@@ -512,6 +514,20 @@ class ApiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match V1 contract"):
             with self.client(incompatible_path):
                 pass
+
+
+class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_loop_survives_unexpected_refresh_failures(self):
+        with patch(
+            "app.main.asyncio.to_thread",
+            side_effect=[RuntimeError("OpenAQ failure"), KeyError("period"), asyncio.CancelledError()],
+        ) as to_thread, patch("app.main.asyncio.sleep", return_value=None) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await main._refresh_loop("secret", Path("current_pm25.json"))
+
+        self.assertEqual(to_thread.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(3600)
 
 
 if __name__ == "__main__":
