@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import math
 import os
 from contextlib import asynccontextmanager
@@ -6,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -19,7 +22,10 @@ from scripts.modeling.features import (
 from scripts.modeling.predict import load_artifact, predict_pm25_t_plus_6
 from scripts.modeling.train import MODEL_TYPE
 from scripts.openmeteo import OpenMeteoError, TARGET_SENSOR_ID, load_pm25_artifact
+from scripts.refresh_pm25 import refresh_current_pm25
 from scripts.run_data_spike import resolve_hour_duplicates
+
+logger = logging.getLogger(__name__)
 
 MODEL_VERSION = "v1"
 CALENDAR_TIMEZONE = "Asia/Ho_Chi_Minh"
@@ -36,6 +42,9 @@ DEFAULT_PM25_ARTIFACT_PATH = (
 DEFAULT_CURRENT_PM25_ARTIFACT_PATH = REPOSITORY_ROOT / ".artifacts" / "live" / "current_pm25.json"
 FRESHNESS_THRESHOLD_HOURS = 4
 INDEX_PATH = Path(__file__).with_name("index.html")
+INVALID_PREDICTION_DETAIL = "Prediction input is invalid."
+FORECAST_SOURCE_UNAVAILABLE_DETAIL = "Forecast source is unavailable."
+FORECAST_DATA_INVALID_DETAIL = "Forecast data is invalid."
 
 
 class Pm25Observation(BaseModel):
@@ -293,6 +302,25 @@ def _current_forecast_state(model, metadata, artifact_path, current_time):
     return artifact, retrieved_at, payload, predicted_pm25, age_minutes, is_stale
 
 
+async def _refresh_loop(api_key, artifact_path):
+    while True:
+        try:
+            await asyncio.to_thread(_refresh_once, api_key, artifact_path)
+        except Exception:
+            logger.exception("Managed PM2.5 refresh failed")
+        await asyncio.sleep(3600)
+
+
+def _refresh_once(api_key, artifact_path):
+    with httpx.Client(timeout=30) as client:
+        refresh_current_pm25(
+            client,
+            api_key,
+            TARGET_SENSOR_ID,
+            artifact_path.parent,
+        )
+
+
 def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_path=None, now=lambda: datetime.now(timezone.utc)):
     configured_path = Path(
         model_path or os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH)
@@ -314,7 +342,25 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         application.state.metadata = metadata
         application.state.pm25_artifact_path = configured_pm25_path
         application.state.current_pm25_artifact_path = configured_current_pm25_path
-        yield
+        refresh_task = None
+        if os.environ.get("AIRAWARE_REFRESH_ENABLED") == "1":
+            api_key = os.environ.get("OPENAQ_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAQ_API_KEY is required when AIRAWARE_REFRESH_ENABLED=1")
+            if configured_current_pm25_path.name != "current_pm25.json":
+                raise RuntimeError("managed refresh requires current artifact filename current_pm25.json")
+            refresh_task = asyncio.create_task(
+                _refresh_loop(api_key, configured_current_pm25_path)
+            )
+        try:
+            yield
+        finally:
+            if refresh_task is not None:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
 
     application = FastAPI(title="AirAware VN", version=MODEL_VERSION, lifespan=lifespan)
 
@@ -340,7 +386,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 payload,
             )
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=INVALID_PREDICTION_DETAIL) from error
 
         target_start = payload.prediction_time + timedelta(
             hours=FORECAST_HORIZON_HOURS
@@ -369,9 +415,9 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 payload,
             )
         except OpenMeteoError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=FORECAST_DATA_INVALID_DETAIL) from error
 
         target_start = payload.prediction_time + timedelta(
             hours=FORECAST_HORIZON_HOURS
@@ -401,9 +447,9 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 current_time,
             )
         except OpenMeteoError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=FORECAST_DATA_INVALID_DETAIL) from error
         target_start = payload.prediction_time + timedelta(hours=FORECAST_HORIZON_HOURS)
         return CurrentForecastResponse(
             prediction_time=payload.prediction_time,

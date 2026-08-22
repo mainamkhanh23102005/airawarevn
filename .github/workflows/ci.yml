@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-stage0.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+      - name: Compile Python sources
+        run: python -m compileall -q app scripts tests
+
+      - name: Check whitespace errors
+        run: git diff --check
