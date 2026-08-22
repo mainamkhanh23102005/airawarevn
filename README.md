@@ -62,9 +62,13 @@ The frozen V1 feature contract contains:
 | PM2.5 history | Calendar context (Asia/Ho_Chi_Minh) |
 |---|---|
 | `pm25_lag_1h` | `hour` |
-| `pm25_lag_3h` | `day_of_week` |
-| `pm25_lag_6h` | `month` |
-| `pm25_lag_12h` | `is_weekend` |
+| `pm25_lag_2h` | `day_of_week` |
+| `pm25_lag_3h` | `month` |
+| `pm25_lag_4h` | `is_weekend` |
+| `pm25_lag_6h` | |
+| `pm25_lag_8h` | |
+| `pm25_lag_12h` | |
+| `pm25_lag_18h` | |
 | `pm25_lag_24h` | |
 | `pm25_rolling_mean_6h` | |
 | `pm25_rolling_mean_12h` | |
@@ -81,35 +85,18 @@ Leakage controls include:
 
 ## Modeling and evaluation
 
-After target and feature availability filtering, the modeling dataset contains 7,330 rows:
+Frozen V1 model and feature selection used expanding-window monthly walk-forward validation. August 2025 through January 2026 formed the initial history; February through June 2026 supplied 3,056 out-of-fold validation predictions. Every fold purged training rows unless their `t+6h` target timestamp was strictly earlier than the validation month start. July 2026 remained untouched until the model and A2 feature configuration were frozen.
 
-| Split | Rows | Method |
-|---|---:|---|
-| Train | 5,131 | First 70% chronologically |
-| Validation | 1,099 | Following 15% |
-| Test | 1,100 | Final 15%; no shuffle |
+| Validation model | Pooled MAE | Pooled RMSE |
+|---|---:|---:|
+| Persistence baseline | 11.3073 | 16.1619 |
+| A2 LinearRegression | **9.8558** | **14.0273** |
 
-Model selection and feature analysis used validation performance. The test partition was treated as the final held-out report rather than choosing whichever model happened to have the lowest test metric.
-
-| Model | Validation MAE | Validation RMSE | Test MAE | Test RMSE |
-|---|---:|---:|---:|---:|
-| Persistence baseline | 11.1580 | 14.9924 | 11.3754 | 16.0023 |
-| **Linear Regression (V1)** | **9.0894** | **12.0908** | 9.6931 | **13.2059** |
-| Ridge (`alpha=0.01`) | 9.0895 | **12.0908** | 9.6931 | 13.2058 |
-| Random Forest | 10.0154 | 13.7373 | 9.7502 | 13.5275 |
-| HistGradientBoosting | 10.0834 | 14.1157 | **9.6853** | 13.5020 |
-
-Linear Regression produced the best validation MAE, essentially tied Ridge without an additional scaling/tuning path, and outperformed the tree models on validation MAE and RMSE. Its test MAE improves on persistence by approximately **14.8%**. HistGradientBoosting's test MAE is 0.0078 lower, but that held-out result was not used to reverse the validation-based selection decision.
+The final July 2026 test used 613 shared timestamps. The frozen A2 LinearRegression fit on 6,711 eligible pre-July rows achieved MAE **8.265** and RMSE **10.468**, versus persistence MAE **9.840** and RMSE **12.530**. This is a **16.01%** MAE improvement and **16.46%** RMSE improvement. These final-test results were not used for further selection or tuning. After final evaluation, the unchanged A2 + LinearRegression specification was retrained on all 7,330 eligible rows for the production artifact; the reported July metrics belong to the pre-July fit, not that post-test artifact.
 
 ### Error analysis
 
-V1 improves average performance but regresses toward the mean:
-
-- low-pollution periods can be overpredicted;
-- high-pollution periods can be underpredicted;
-- for actual PM2.5 `>=55 µg/m³` (`n=27`), MAE was approximately `34.43 µg/m³` and signed bias was approximately `-34.36 µg/m³`.
-
-This makes extreme pollution spikes the clearest modeling weakness and a priority for future feature and model work.
+V1 still underpredicts high pollution. On July observations above `35 µg/m³` (`n=91`), signed bias was approximately `-8.427 µg/m³` and underprediction rate was `81.32%`. July contained no observations above `75 µg/m³`, so the validation-era extreme-pollution limitation remains unresolved and is a V2 research question rather than a reason to alter frozen V1.
 
 ## Why weather is excluded from V1
 
@@ -233,7 +220,7 @@ python -m unittest discover -s tests
 python -m compileall -q app scripts tests
 ```
 
-Current verified state: **136 passing tests**, with external OpenAQ calls mocked in unit tests.
+The full portable test suite passes without network access. Canonical-data regression tests additionally run when the regenerated frozen PM2.5 artifact is present; the latest local canonical-artifact verification ran **152 tests**. External OpenAQ calls are mocked in unit tests.
 
 ## Repository structure
 

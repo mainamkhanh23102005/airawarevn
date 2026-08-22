@@ -5,13 +5,14 @@ import sys
 import tempfile
 import unittest
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
 
 from scripts import openaq, openmeteo
+from scripts.modeling.train_cli import load_frozen_pm25_dataframe
 
 
 UTC = timezone.utc
@@ -215,6 +216,28 @@ class CoverageTests(unittest.TestCase):
         for label in ("Sensor:", "Source date range:", "Frozen candidate:", "Expected hours:", "Observed hours:", "Valid PM2.5 hours:", "Timestamp completeness:", "Usable PM2.5 coverage:", "Winter completeness:", "Winter usable coverage:", "Longest gap:", "PM2.5 gate:", "Normalized artifact path:", "Coverage artifact path:"):
             self.assertIn(label, output.getvalue())
         self.assertIn(str(paths["normalized_path"]), output.getvalue())
+
+    def test_normalized_artifact_contains_only_frozen_candidate_records(self):
+        start = datetime(2022, 11, 1, tzinfo=openaq.HANOI).astimezone(UTC)
+        end = datetime(2023, 11, 1, tzinfo=openaq.HANOI).astimezone(UTC)
+        records = [
+            {"sensor_id": 13502151, "event_time": datetime(2022, 10, 31, 16, tzinfo=UTC), "period_end_utc": start, "value": 9, "unit": "µg/m³", "record_id": 1},
+            {"sensor_id": 13502151, "event_time": start, "period_end_utc": start.replace(hour=18), "value": 10, "unit": "µg/m³", "record_id": 2},
+            {"sensor_id": 13502151, "event_time": end, "period_end_utc": end.replace(hour=18), "value": 11, "unit": "µg/m³", "record_id": 3},
+            {"sensor_id": 13502151, "event_time": end + timedelta(hours=1), "period_end_utc": end + timedelta(hours=2), "value": 12, "unit": "µg/m³", "record_id": 4},
+        ]
+        metadata = {"sensor_id": 13502151, "coordinates": {"latitude": 21.0031, "longitude": 105.7947}}
+        candidate = Mock(start_utc=start, end_utc=end)
+        with tempfile.TemporaryDirectory() as directory, patch("scripts.run_data_spike.select_primary_candidate_interval", return_value=candidate):
+            paths = openaq.write_coverage_artifacts(records, metadata, Path(directory), source_start=start, source_end=end)
+            normalized = json.loads(paths["normalized_path"].read_text())
+            loaded = load_frozen_pm25_dataframe(paths["normalized_path"])
+            report = json.loads(paths["coverage_path"].read_text())
+        self.assertEqual([row["event_time"] for row in normalized["normalized_records"]], [start.isoformat()])
+        self.assertEqual(len(loaded), 8760)
+        self.assertEqual(loaded["pm25"].notna().sum(), 1)
+        self.assertEqual(report["coverage"]["expected_hours"], 8760)
+        self.assertEqual(report["raw_row_count"], len(records))
 
     def test_winter_reports_percentages_and_explicit_status(self):
         start = datetime(2022, 11, 1, tzinfo=openaq.HANOI).astimezone(UTC)

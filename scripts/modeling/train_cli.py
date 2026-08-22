@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -190,6 +191,9 @@ def main(argv=None) -> Path:
     try:
         modeling_df = build_modeling_dataframe(args.input)
         model, metadata = train_v1_model(modeling_df)
+        metadata["training_input_sha256"] = hashlib.sha256(
+            args.input.read_bytes()
+        ).hexdigest()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = None
         try:

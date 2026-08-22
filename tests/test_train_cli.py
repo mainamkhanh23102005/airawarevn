@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import tempfile
@@ -101,6 +102,10 @@ class TrainCliSmokeTests(unittest.TestCase):
         self.assertEqual(metadata["forecast_horizon_hours"], FORECAST_HORIZON_HOURS)
         self.assertFalse(metadata["raw_pm25_is_feature"])
         self.assertFalse(metadata["weather_is_feature"])
+        self.assertEqual(
+            metadata["training_input_sha256"],
+            hashlib.sha256(self.input_path.read_bytes()).hexdigest(),
+        )
 
         modeling_df = build_modeling_dataframe(self.input_path)
         prediction = predict_pm25_t_plus_6(

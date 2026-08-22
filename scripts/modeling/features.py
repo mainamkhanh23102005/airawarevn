@@ -14,6 +14,10 @@ V1_FEATURE_COLUMNS = [
     "day_of_week",
     "month",
     "is_weekend",
+    "pm25_lag_2h",
+    "pm25_lag_4h",
+    "pm25_lag_8h",
+    "pm25_lag_18h",
 ]
 TARGET_COLUMN = "target_pm25_t_plus_6"
 FORECAST_HORIZON_HOURS = 6
@@ -36,7 +40,7 @@ def build_v1_features(dataframe, include_target=False):
     result["event_time"] = pd.to_datetime(result["event_time"], utc=True)
     result = result.sort_values("event_time").reset_index(drop=True)
 
-    for lag in [1, 3, 6, 12, 24]:
+    for lag in [1, 2, 3, 4, 6, 8, 12, 18, 24]:
         result[f"pm25_lag_{lag}h"] = result["pm25"].shift(lag)
 
     historical_pm25 = result["pm25"].shift(1)

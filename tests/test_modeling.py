@@ -31,6 +31,10 @@ class FeatureTests(unittest.TestCase):
                 "day_of_week",
                 "month",
                 "is_weekend",
+                "pm25_lag_2h",
+                "pm25_lag_4h",
+                "pm25_lag_8h",
+                "pm25_lag_18h",
             ],
         )
         self.assertNotIn("pm25", V1_FEATURE_COLUMNS)
@@ -52,11 +56,26 @@ class FeatureTests(unittest.TestCase):
         row = result.iloc[24]
 
         self.assertEqual(row["pm25_lag_1h"], 23)
+        self.assertEqual(row["pm25_lag_2h"], 22)
         self.assertEqual(row["pm25_lag_3h"], 21)
+        self.assertEqual(row["pm25_lag_4h"], 20)
+        self.assertEqual(row["pm25_lag_8h"], 16)
+        self.assertEqual(row["pm25_lag_18h"], 6)
         self.assertEqual(row["pm25_lag_24h"], 0)
         self.assertEqual(row["pm25_rolling_mean_6h"], 20.5)
         self.assertEqual(row["pm25_rolling_mean_24h"], 11.5)
         self.assertEqual(row[TARGET_COLUMN], 30)
+
+    def test_missing_pm25_propagates_to_new_lags_without_filling(self):
+        frame = pd.DataFrame({
+            "event_time": pd.date_range("2025-01-01T00:00:00Z", periods=30, freq="1h"),
+            "pm25": [float(value) for value in range(30)],
+        })
+        frame.loc[10, "pm25"] = None
+        result = build_v1_features(frame, include_target=True)
+        for lag in (2, 4, 8, 18):
+            self.assertTrue(pd.isna(result.loc[10 + lag, f"pm25_lag_{lag}h"]))
+        self.assertTrue(pd.isna(result.loc[10 - 6, TARGET_COLUMN]))
 
     def test_builds_vietnam_local_calendar_features_and_sorts_rows(self):
         frame = pd.DataFrame(
@@ -129,6 +148,8 @@ class ModelingTests(unittest.TestCase):
 
         self.assertEqual(before.tolist(), after.tolist())
         self.assertEqual(loaded_metadata["feature_columns"], V1_FEATURE_COLUMNS)
+        self.assertEqual(loaded_metadata["feature_configuration"], "A2")
+        self.assertEqual(loaded_metadata["forecast_horizon_hours"], 6)
 
 
 if __name__ == "__main__":

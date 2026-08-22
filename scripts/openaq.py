@@ -168,6 +168,7 @@ def write_coverage_artifacts(records, sensor_metadata, coverage_directory, sourc
         "normalized_records": [
             {**record, "event_time": record["event_time"].isoformat(), "period_end_utc": record["period_end_utc"].isoformat()}
             for record in records
+            if _parse_utc(frozen["start_utc"]) <= record["event_time"] < _parse_utc(frozen["end_utc"])
         ],
     }
     normalized_path.write_text(json.dumps(normalized, indent=2, sort_keys=True) + "\n")
