@@ -33,6 +33,7 @@ def train_v1_model(dataframe):
         "artifact_version": 1,
         "model_type": MODEL_TYPE,
         "feature_columns": V1_FEATURE_COLUMNS.copy(),
+        "feature_configuration": "A2",
         "target_column": TARGET_COLUMN,
         "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
         "calendar_timezone": "Asia/Ho_Chi_Minh",
