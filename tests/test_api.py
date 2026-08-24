@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.main import create_app
+from app.forecast_ledger import ForecastRecord, SQLiteForecastStore
 from scripts.modeling.features import V1_FEATURE_COLUMNS, build_v1_features
 from scripts.modeling.predict import predict_pm25_t_plus_6
 from scripts.modeling.train import save_artifact, train_v1_model
@@ -522,6 +524,62 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Previous readings hidden", response.text)
         self.assertNotIn("body.detail", response.text)
         self.assertNotIn("error.message", response.text)
+
+    def ledger_record(self):
+        return ForecastRecord.create(sensor_id=13502151, prediction_time=self.prediction_time,
+            predicted_pm25=42.5, persistence_prediction=24.0, model_version="v1",
+            model_artifact_sha256="a" * 64, feature_schema_sha256="b" * 64,
+            artifact_version=1, feature_configuration="A2", source_retrieved_at=self.prediction_time,
+            input_data_cutoff=self.prediction_time, history_start=self.prediction_time - timedelta(hours=24),
+            history_end=self.prediction_time - timedelta(hours=1), data_mode_at_issue="fresh_openaq",
+            freshness_status_at_issue="fresh", source_age_minutes_at_issue=0,
+            issued_at=self.prediction_time + timedelta(minutes=1))
+
+    def test_disabled_current_response_remains_exactly_existing_schema(self):
+        self.write_current_pm25_artifact()
+        with self.client(now=lambda: self.prediction_time) as client:
+            body = client.get("/forecast/current").json()
+        self.assertEqual(set(body), {"prediction_time", "target_interval_start", "target_interval_end", "forecast_horizon_hours", "predicted_pm25", "unit", "model_version", "latest_completed_pm25", "history_start", "history_end", "data_mode", "source_retrieved_at", "sensor_id", "freshness_status", "age_minutes"})
+
+    def test_enabled_current_reads_issued_record_without_source_or_prediction(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store = SQLiteForecastStore(database); store.initialize(); store.insert(self.ledger_record())
+        with patch("app.main._current_forecast_state", side_effect=AssertionError("must not run")):
+            with TestClient(create_app(self.artifact_path, self.pm25_artifact_path, self.current_pm25_artifact_path, now=lambda: self.prediction_time, forecast_ledger_path=database)) as client:
+                response = client.get("/forecast/current")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["predicted_pm25"], 42.5)
+
+    def test_enabled_current_recomputes_request_state_without_mutating_issuance(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        record = self.ledger_record(); store = SQLiteForecastStore(database); store.initialize(); store.insert(record)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database, now=lambda: self.prediction_time + timedelta(hours=5))) as client:
+            body = client.get("/forecast/current").json()
+        self.assertEqual((body["age_minutes"], body["freshness_status"], body["data_mode"]), (300.0, "stale", "stale_openaq"))
+        self.assertEqual(store.get_by_id(record.forecast_id), record)
+
+    def test_read_routes_never_insert_ledger_records(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        self.write_current_pm25_artifact()
+        with TestClient(create_app(self.artifact_path, self.pm25_artifact_path, self.current_pm25_artifact_path, now=lambda: self.prediction_time, forecast_ledger_path=database)) as client:
+            client.get("/status"); client.get("/forecast/latest"); client.post("/predict", json=self.payload())
+        self.assertEqual(SQLiteForecastStore(database).count(), 0)
+
+    def test_enabled_empty_ledger_is_sanitized_unavailable(self):
+        database = Path(self.directory.name) / "private-secret-ledger.sqlite3"
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/forecast/current")
+        self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast source is unavailable."}))
+        self.assertNotIn(str(database), response.text)
+
+    def test_enabled_sqlite_error_is_sanitized(self):
+        database = Path(self.directory.name) / "private-secret-ledger.sqlite3"
+        with patch("app.forecast_ledger.SQLiteForecastStore.latest", side_effect=sqlite3.OperationalError(f"SQL at {database}")):
+            with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+                response = client.get("/forecast/current")
+        self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast source is unavailable."}))
+        self.assertNotIn("SQL", response.text)
+        self.assertNotIn(str(database), response.text)
 
     def test_missing_or_corrupt_artifact_fails_during_startup(self):
         missing_path = Path(self.directory.name) / "missing.joblib"

@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.forecast_ledger import SQLiteForecastStore
 from scripts.modeling.features import (
     FORECAST_HORIZON_HOURS,
     V1_FEATURE_COLUMNS,
@@ -321,7 +323,7 @@ def _refresh_once(api_key, artifact_path):
         )
 
 
-def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_path=None, now=lambda: datetime.now(timezone.utc)):
+def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_path=None, now=lambda: datetime.now(timezone.utc), forecast_ledger_path=None):
     configured_path = Path(
         model_path or os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH)
     )
@@ -333,6 +335,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         current_pm25_artifact_path
         or os.environ.get("AIRAWARE_CURRENT_PM25_ARTIFACT_PATH", DEFAULT_CURRENT_PM25_ARTIFACT_PATH)
     )
+    configured_ledger_path = forecast_ledger_path or os.environ.get("AIRAWARE_FORECAST_LEDGER_PATH")
 
     @asynccontextmanager
     async def lifespan(application):
@@ -342,6 +345,10 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         application.state.metadata = metadata
         application.state.pm25_artifact_path = configured_pm25_path
         application.state.current_pm25_artifact_path = configured_current_pm25_path
+        application.state.forecast_store = None
+        if configured_ledger_path:
+            application.state.forecast_store = SQLiteForecastStore(configured_ledger_path)
+            application.state.forecast_store.initialize()
         refresh_task = None
         if os.environ.get("AIRAWARE_REFRESH_ENABLED") == "1":
             api_key = os.environ.get("OPENAQ_API_KEY")
@@ -439,6 +446,25 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
     @application.get("/forecast/current", response_model=CurrentForecastResponse)
     def current_forecast(request: Request):
         current_time = now().astimezone(timezone.utc)
+        store = request.app.state.forecast_store
+        if store is not None:
+            try:
+                record = store.latest()
+            except sqlite3.Error as error:
+                raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
+            if record is None:
+                raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL)
+            age_minutes = max(0.0, (current_time - record.prediction_time).total_seconds() / 60)
+            is_stale = age_minutes > FRESHNESS_THRESHOLD_HOURS * 60
+            return CurrentForecastResponse(
+                prediction_time=record.prediction_time, target_interval_start=record.target_interval_start,
+                target_interval_end=record.target_interval_end, forecast_horizon_hours=record.forecast_horizon_hours,
+                predicted_pm25=record.predicted_pm25, unit=record.unit, model_version=record.model_version,
+                latest_completed_pm25=record.persistence_prediction, history_start=record.history_start,
+                history_end=record.history_end, data_mode="stale_openaq" if is_stale else "fresh_openaq",
+                source_retrieved_at=record.source_retrieved_at, sensor_id=record.sensor_id,
+                freshness_status="stale" if is_stale else "fresh", age_minutes=age_minutes,
+            )
         try:
             artifact, retrieved_at, payload, predicted_pm25, age_minutes, is_stale = _current_forecast_state(
                 request.app.state.model,

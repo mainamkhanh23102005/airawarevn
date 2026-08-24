@@ -23,6 +23,8 @@ dist/
 .artifacts/data_spike/
 .artifacts/live/
 .artifacts/models/
+.artifacts/forecast-ledger/
+*.sqlite3
 
 # OS and editor noise
 .DS_Store
