@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import io
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -85,6 +86,102 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(record["sensor_id"], 9)
         self.assertEqual(record["event_time"], datetime(2024, 1, 1, tzinfo=UTC))
         self.assertEqual(record["period_end_utc"], datetime(2024, 1, 1, 1, tzinfo=UTC))
+
+    def test_reconciliation_fetch_preserves_exact_decimal_without_changing_default(self):
+        payload = '{"results":[{"id":1,"value":1.2300e-3,"parameter":{"units":"mg/m³"},"period":{"datetimeFrom":{"utc":"2024-01-01T00:00:00Z"},"datetimeTo":{"utc":"2024-01-01T01:00:00Z"}}}]}'.encode()
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=payload))) as client:
+            records, _ = openaq.fetch_hours(client, "key", 9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), Path(directory), preserve_decimal=True)
+        self.assertEqual(records[0]["value_decimal"], Decimal("0.0012300"))
+        self.assertIsInstance(records[0]["value_decimal"], Decimal)
+
+    def test_reconciliation_source_builds_exact_evidence_batch(self):
+        payload = '{"results":[{"id":1,"value":1.2300e-3,"parameter":{"units":"mg/m³"},"period":{"datetimeFrom":{"utc":"2024-01-01T00:00:00Z"},"datetimeTo":{"utc":"2024-01-01T01:00:00Z"}}}]}'.encode()
+        retrieved = datetime(2025, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=payload))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), now=lambda: retrieved)
+            batch = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(batch.records[0]["value_decimal"], Decimal("0.0012300"))
+        self.assertEqual(batch.raw_payload_sha256, __import__("hashlib").sha256(payload).hexdigest())
+        self.assertEqual(batch.retrieved_at.microsecond, 0)
+        self.assertEqual(batch.source_endpoint, "/sensors/9/hours")
+
+    def test_reconciliation_source_preserves_each_paginated_response(self):
+        def handler(request):
+            page = int(request.url.params["page"])
+            return response([hour_row(row_id=page)] if page == 1 else [], 1)
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), now=lambda: datetime(2025, 1, 1, tzinfo=UTC), limit=1)
+            batches = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(len(batches), 2)
+        self.assertEqual([len(batch.records) for batch in batches], [1, 0])
+        self.assertEqual(len({batch.raw_payload_sha256 for batch in batches}), 2)
+
+    def test_reconciliation_source_keeps_irrelevant_malformed_rows_for_target_aware_filtering(self):
+        target = hour_row()
+        wrong_sensor = {"sensor_id": 999, "value": "N/A", "period": {"datetimeFrom": {"utc": "bad"}}}
+        wrong_hour = {"value": None, "period": {"datetimeFrom": {"utc": "2023-12-31T23:00:00Z"}}}
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: response([target, wrong_sensor, wrong_hour]))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory))
+            batch = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(len(batch.records), 3)
+        self.assertEqual(batch.records[0]["sensor_id"], 9)
+        self.assertEqual(batch.records[1]["sensor_id"], 999)
+        self.assertEqual(batch.records[2]["event_time"], datetime(2023, 12, 31, 23, tzinfo=UTC))
+
+    def test_reconciliation_source_preserves_well_formed_row_sensor_identity(self):
+        foreign = {**hour_row(), "sensor_id": 999}
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: response([foreign]))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory))
+            batch = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(batch.records[0]["sensor_id"], 999)
+
+    def test_reconciliation_source_preserves_unprovable_malformed_row(self):
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: response([hour_row(), {"value": 1}]))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory))
+            batch = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(batch.records[1], {"malformed": True, "value_decimal": Decimal("1")})
+
+    def test_reconciliation_source_preserves_unprovable_nonnumeric_value(self):
+        malformed = {"value": "N/A"}
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: response([malformed]))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory))
+            batch = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(batch.records, ({"malformed": True},))
+
+    def test_reconciliation_source_stops_at_configured_page_bound(self):
+        pages = []
+        def handler(request):
+            pages.append(int(request.url.params["page"]))
+            return response([hour_row(row_id=pages[-1])])
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), limit=1, max_pages=2)
+            from app.ground_truth_reconciler import SourceTransportError
+            with self.assertRaises(SourceTransportError):
+                source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(pages, [1, 2])
+
+    def test_reconciliation_source_keeps_first_page_raw_evidence_when_later_page_fails(self):
+        def handler(request):
+            return response([hour_row()]) if request.url.params["page"] == "1" else httpx.Response(503)
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), limit=1, sleep=lambda seconds: None)
+            from app.ground_truth_reconciler import SourceTransportError
+            with self.assertRaises(SourceTransportError):
+                source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+            self.assertEqual(len(list(Path(directory).glob("*.json"))), 2)
+
+    def test_reconciliation_source_maps_transport_and_parse_errors(self):
+        from app.ground_truth_reconciler import SourceParseError, SourceTransportError
+        cases = [(httpx.Response(503), SourceTransportError), (httpx.Response(200, content=b"bad"), SourceParseError)]
+        for response_value, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(lambda request: response_value)) as client:
+                source = openaq.OpenAQObservationSource(client, "key", Path(directory), sleep=lambda seconds: None)
+                with self.assertRaises(expected):
+                    source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
 
     def test_provenance_has_exact_fields_and_raw_exact_bytes(self):
         payload = b'{"results":[],"meta":{"found":0}}'
