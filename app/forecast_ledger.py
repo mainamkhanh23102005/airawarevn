@@ -14,7 +14,7 @@ from scripts.modeling.features import FORECAST_HORIZON_HOURS, TARGET_COLUMN, V1_
 
 
 FORECAST_NAMESPACE = uuid.UUID("e60f879b-90cf-51a4-8936-aad3c962371c")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -184,18 +184,119 @@ class SQLiteForecastStore:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
-    def initialize(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _forecast_schema(self):
         declarations = []
         for field in fields(ForecastRecord):
             kind = "INTEGER" if field.name in {"sensor_id", "forecast_horizon_hours", "artifact_version"} else "REAL" if field.name in {"predicted_pm25", "persistence_prediction", "source_age_minutes_at_issue"} else "TEXT"
             declarations.append(f"{field.name} {kind} NOT NULL" + (" PRIMARY KEY" if field.name == "forecast_id" else ""))
-        unique = ", UNIQUE (" + ", ".join(IDENTITY_FIELDS) + ")"
-        with closing(self._connect()) as connection, connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS forecasts (" + ", ".join(declarations) + unique + ")")
-            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        return "CREATE TABLE forecasts (" + ", ".join(declarations) + ", UNIQUE (" + ", ".join(IDENTITY_FIELDS) + "))"
+
+    def _validate_forecasts_schema(self, connection):
+        columns = {row[1]: row for row in connection.execute("PRAGMA table_info(forecasts)")}
+        if set(columns) != {field.name for field in fields(ForecastRecord)} or columns.get("forecast_id", (None,) * 6)[5] != 1:
+            raise RuntimeError("unsupported forecasts schema")
+        indexes = list(connection.execute("PRAGMA index_list(forecasts)"))
+        unique_columns = [tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})")) for index in indexes if index[2]]
+        if IDENTITY_FIELDS not in unique_columns:
+            raise RuntimeError("unsupported forecasts schema")
+
+    def _validate_m2_schema(self, connection):
+        expected_columns = {
+            "observation_acquisitions": {"acquisition_id", "sensor_id", "requested_interval_start", "requested_interval_end", "retrieved_at", "source_provider", "source_endpoint", "http_status", "raw_payload_sha256", "normalized_payload_sha256", "created_at"},
+            "forecast_reconciliations": {"reconciliation_id", "forecast_id", "acquisition_id", "sensor_id", "target_interval_start", "target_interval_end", "observed_pm25", "unit", "observation_event_time", "observation_period_end", "source_record_ids_json", "source_retrieved_at", "raw_payload_sha256", "normalized_candidate_sha256", "reconciled_at", "truth_policy_version", "reconciliation_delay_minutes"},
+            "observation_revisions": {"revision_id", "reconciliation_id", "acquisition_id", "observed_pm25", "unit", "source_record_ids_json", "source_retrieved_at", "raw_payload_sha256", "normalized_candidate_sha256", "detected_at"},
+        }
+        expected_primary = {
+            "observation_acquisitions": "acquisition_id",
+            "forecast_reconciliations": "reconciliation_id",
+            "observation_revisions": "revision_id",
+        }
+        expected_unique = {
+            "observation_acquisitions": {("acquisition_id",), ("sensor_id", "requested_interval_start", "requested_interval_end", "retrieved_at", "raw_payload_sha256")},
+            "forecast_reconciliations": {("reconciliation_id",), ("forecast_id",)},
+            "observation_revisions": {("revision_id",), ("reconciliation_id", "acquisition_id")},
+        }
+        expected_foreign = {
+            "observation_acquisitions": set(),
+            "forecast_reconciliations": {("acquisition_id", "observation_acquisitions", "acquisition_id"), ("forecast_id", "forecasts", "forecast_id")},
+            "observation_revisions": {("acquisition_id", "observation_acquisitions", "acquisition_id"), ("reconciliation_id", "forecast_reconciliations", "reconciliation_id")},
+        }
+        for table, columns in expected_columns.items():
+            info = list(connection.execute(f"PRAGMA table_info({table})"))
+            primary = {row[1] for row in info if row[5]}
+            if {row[1] for row in info} != columns or primary != {expected_primary[table]}:
+                raise RuntimeError("unsupported schema")
+            indexes = list(connection.execute(f"PRAGMA index_list({table})"))
+            unique = {tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})")) for index in indexes if index[2]}
+            if not expected_unique[table] <= unique:
+                raise RuntimeError("unsupported schema")
+            foreign = {(row[3], row[2], row[4]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
+            if foreign != expected_foreign[table]:
+                raise RuntimeError("unsupported schema")
+
+    def _create_m2_schema(self, connection):
+        connection.execute("""CREATE TABLE observation_acquisitions (
+            acquisition_id TEXT PRIMARY KEY, sensor_id INTEGER NOT NULL,
+            requested_interval_start TEXT NOT NULL, requested_interval_end TEXT NOT NULL,
+            retrieved_at TEXT NOT NULL, source_provider TEXT NOT NULL, source_endpoint TEXT NOT NULL,
+            http_status INTEGER NOT NULL, raw_payload_sha256 TEXT NOT NULL,
+            normalized_payload_sha256 TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(sensor_id, requested_interval_start, requested_interval_end, retrieved_at, raw_payload_sha256))""")
+        connection.execute("""CREATE TABLE forecast_reconciliations (
+            reconciliation_id TEXT PRIMARY KEY, forecast_id TEXT NOT NULL UNIQUE,
+            acquisition_id TEXT NOT NULL, sensor_id INTEGER NOT NULL,
+            target_interval_start TEXT NOT NULL, target_interval_end TEXT NOT NULL,
+            observed_pm25 REAL NOT NULL, unit TEXT NOT NULL,
+            observation_event_time TEXT NOT NULL, observation_period_end TEXT NOT NULL,
+            source_record_ids_json TEXT NOT NULL, source_retrieved_at TEXT NOT NULL,
+            raw_payload_sha256 TEXT NOT NULL, normalized_candidate_sha256 TEXT NOT NULL,
+            reconciled_at TEXT NOT NULL, truth_policy_version INTEGER NOT NULL,
+            reconciliation_delay_minutes INTEGER NOT NULL,
+            FOREIGN KEY(forecast_id) REFERENCES forecasts(forecast_id),
+            FOREIGN KEY(acquisition_id) REFERENCES observation_acquisitions(acquisition_id))""")
+        connection.execute("""CREATE TABLE observation_revisions (
+            revision_id TEXT PRIMARY KEY, reconciliation_id TEXT NOT NULL,
+            acquisition_id TEXT NOT NULL, observed_pm25 REAL NOT NULL, unit TEXT NOT NULL,
+            source_record_ids_json TEXT NOT NULL, source_retrieved_at TEXT NOT NULL,
+            raw_payload_sha256 TEXT NOT NULL, normalized_candidate_sha256 TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            UNIQUE(reconciliation_id, acquisition_id),
+            FOREIGN KEY(reconciliation_id) REFERENCES forecast_reconciliations(reconciliation_id),
+            FOREIGN KEY(acquisition_id) REFERENCES observation_acquisitions(acquisition_id))""")
+
+    def initialize(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._connect()) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if version > SCHEMA_VERSION:
+                raise RuntimeError("unsupported schema version")
+            if version == 0 and tables:
+                raise RuntimeError("unsupported schema")
+            if version == SCHEMA_VERSION:
+                self._validate_forecasts_schema(connection)
+                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions"}
+                if not required <= tables:
+                    raise RuntimeError("unsupported schema")
+                self._validate_m2_schema(connection)
+                return
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if version == 0:
+                    connection.execute(self._forecast_schema())
+                elif version == 1:
+                    self._validate_forecasts_schema(connection)
+                else:
+                    raise RuntimeError("unsupported schema version")
+                self._create_m2_schema(connection)
+                connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def _after_insert(self, connection, record):
         pass
@@ -247,9 +348,122 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return self._row(connection.execute("SELECT * FROM forecasts ORDER BY issued_at DESC, rowid DESC LIMIT 1").fetchone())
 
+    def eligible_forecasts(self, now, delay_minutes, limit=None):
+        cutoff = _timestamp(_utc(now, "now") - timedelta(minutes=delay_minutes))
+        sql = """SELECT forecasts.* FROM forecasts
+            LEFT JOIN forecast_reconciliations USING(forecast_id)
+            WHERE forecast_reconciliations.forecast_id IS NULL AND forecasts.target_interval_end<=?
+            ORDER BY forecasts.target_interval_end ASC, forecasts.forecast_id ASC"""
+        parameters = [cutoff]
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        with closing(self._connect()) as connection:
+            return [self._row(row) for row in connection.execute(sql, parameters)]
+
+    def forecasts_for_targets(self, targets):
+        if not targets:
+            return []
+        clauses, values = [], []
+        for sensor_id, start, end in targets:
+            clauses.append("(sensor_id=? AND target_interval_start=? AND target_interval_end=?)")
+            values.extend((sensor_id, _timestamp(start), _timestamp(end)))
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT * FROM forecasts WHERE " + " OR ".join(clauses) + " ORDER BY target_interval_end, forecast_id", values)
+            return [self._row(row) for row in rows]
+
     def count(self):
         with closing(self._connect()) as connection:
             return connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
+
+    def _acquisition_values(self, batch):
+        return (batch.acquisition_id, batch.sensor_id, _timestamp(batch.requested_interval_start),
+            _timestamp(batch.requested_interval_end), _timestamp(batch.retrieved_at), batch.source_provider,
+            batch.source_endpoint, batch.http_status, batch.raw_payload_sha256, batch.normalized_payload_sha256,
+            _timestamp(batch.created_at))
+
+    def _persist_acquisition_connection(self, connection, batch):
+        values = self._acquisition_values(batch)
+        existing = connection.execute("SELECT * FROM observation_acquisitions WHERE acquisition_id=?", (batch.acquisition_id,)).fetchone()
+        if existing is None:
+            try:
+                connection.execute("INSERT INTO observation_acquisitions VALUES (?,?,?,?,?,?,?,?,?,?,?)", values)
+                return
+            except sqlite3.IntegrityError:
+                existing = connection.execute("SELECT * FROM observation_acquisitions WHERE acquisition_id=?", (batch.acquisition_id,)).fetchone()
+        if existing is None or tuple(existing) != values:
+            raise ForecastIntegrityError("immutable acquisition conflict")
+
+    def persist_acquisition(self, batch):
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._persist_acquisition_connection(connection, batch)
+            connection.commit()
+
+    def settle(self, forecast, batch, candidates, reconciled_at, policy):
+        from app.ground_truth_reconciler import ReconcileResult, _canonical_json, _identity, normalized_sha256, RECONCILIATION_NAMESPACE, REVISION_NAMESPACE
+        value_text = candidates[0][1]
+        value = float(value_text)
+        ids = sorted((record.get("record_id") for record, _ in candidates), key=lambda item: (item is not None, str(item)))
+        ids_json = _canonical_json([None if item is None else str(item) for item in ids])
+        candidate_hash = normalized_sha256([record for record, _ in candidates])
+        reconciliation_id = _identity(RECONCILIATION_NAMESPACE, {"reconciliation_identity_version": 1,
+            "forecast_id": forecast.forecast_id, "truth_policy_version": policy.version})
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._persist_acquisition_connection(connection, batch)
+            stored_forecast = connection.execute("SELECT * FROM forecasts WHERE forecast_id=?", (forecast.forecast_id,)).fetchone()
+            stored_acquisition = connection.execute("SELECT * FROM observation_acquisitions WHERE acquisition_id=?", (batch.acquisition_id,)).fetchone()
+            if stored_forecast is None or self._row(stored_forecast) != forecast:
+                raise ForecastIntegrityError("forecast relationship conflict")
+            request_start = _parse_timestamp(stored_acquisition["requested_interval_start"])
+            request_end = _parse_timestamp(stored_acquisition["requested_interval_end"])
+            if stored_acquisition["sensor_id"] != forecast.sensor_id or request_start > forecast.target_interval_start or request_end < forecast.target_interval_end:
+                raise ForecastIntegrityError("acquisition relationship conflict")
+            existing = connection.execute("SELECT * FROM forecast_reconciliations WHERE forecast_id=?", (forecast.forecast_id,)).fetchone()
+            if existing is None:
+                connection.execute("""INSERT INTO forecast_reconciliations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (reconciliation_id, forecast.forecast_id, batch.acquisition_id, forecast.sensor_id,
+                     _timestamp(forecast.target_interval_start), _timestamp(forecast.target_interval_end), value, "µg/m³",
+                     _timestamp(forecast.target_interval_start), _timestamp(forecast.target_interval_end), ids_json,
+                     _timestamp(batch.retrieved_at), batch.raw_payload_sha256, candidate_hash, _timestamp(reconciled_at),
+                     policy.version, policy.delay_minutes))
+                connection.commit()
+                return ReconcileResult("reconciled")
+            if existing["observed_pm25"] == value:
+                connection.commit()
+                return ReconcileResult("already_reconciled")
+            revision_id = _identity(REVISION_NAMESPACE, {"revision_identity_version": 1,
+                "reconciliation_id": existing["reconciliation_id"], "acquisition_id": batch.acquisition_id})
+            revision_values = (revision_id, existing["reconciliation_id"], batch.acquisition_id, value, "µg/m³", ids_json,
+                _timestamp(batch.retrieved_at), batch.raw_payload_sha256, candidate_hash, _timestamp(reconciled_at))
+            stored_revision = connection.execute("SELECT * FROM observation_revisions WHERE revision_id=?", (revision_id,)).fetchone()
+            if stored_revision is None:
+                try:
+                    connection.execute("INSERT INTO observation_revisions VALUES (?,?,?,?,?,?,?,?,?,?)", revision_values)
+                except sqlite3.IntegrityError:
+                    stored_revision = connection.execute("SELECT * FROM observation_revisions WHERE revision_id=?", (revision_id,)).fetchone()
+            if stored_revision is not None and tuple(stored_revision) != revision_values:
+                raise ForecastIntegrityError("immutable revision conflict")
+            connection.commit()
+            return ReconcileResult("revision_detected")
+
+    def get_reconciliation(self, forecast_id):
+        from app.ground_truth_reconciler import ReconciliationRecord
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM forecast_reconciliations WHERE forecast_id=?", (forecast_id,)).fetchone()
+        if row is None:
+            return None
+        return ReconciliationRecord(row["reconciliation_id"], row["forecast_id"], row["acquisition_id"],
+            row["observed_pm25"], _parse_timestamp(row["source_retrieved_at"]))
+
+    def count_acquisitions(self):
+        with closing(self._connect()) as connection:
+            return connection.execute("SELECT COUNT(*) FROM observation_acquisitions").fetchone()[0]
+
+    def count_revisions(self):
+        with closing(self._connect()) as connection:
+            return connection.execute("SELECT COUNT(*) FROM observation_revisions").fetchone()[0]
 
 
 def _record_json(record):

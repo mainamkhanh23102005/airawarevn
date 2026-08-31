@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 import time
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,51 @@ PROVENANCE_FIELDS = {"endpoint", "sensor_id", "page", "limit", "datetime_from", 
 
 class OpenAQError(RuntimeError):
     pass
+
+
+class OpenAQObservationSource:
+    def __init__(self, client, api_key, raw_directory, sleep=time.sleep, now=lambda: datetime.now(UTC), limit=1000, max_pages=100):
+        if type(max_pages) is not int or max_pages <= 0:
+            raise ValueError("max_pages must be a positive integer")
+        self.client = client
+        self.api_key = api_key
+        self.raw_directory = raw_directory
+        self.sleep = sleep
+        self.now = now
+        self.limit = limit
+        self.max_pages = max_pages
+
+    def acquire(self, sensor_id, start, end):
+        from app.ground_truth_reconciler import AcquisitionBatch, SourceParseError, SourceTransportError, normalized_sha256
+        batches, page = [], 1
+        while True:
+            params = {"datetime_from": start.isoformat(), "datetime_to": end.isoformat(), "limit": self.limit, "page": page}
+            try:
+                payload, item = _request(self.client, self.api_key, f"/sensors/{sensor_id}/hours", params,
+                    self.raw_directory, sensor_id, self.sleep, self.now, True)
+                rows = payload.get("results", [])
+                if not isinstance(rows, list):
+                    raise SourceParseError("OpenAQ results is not a list")
+                records = [normalize_measurement_for_reconciliation(row, sensor_id) for row in rows]
+                digest = normalized_sha256(record for record in records if not record.get("malformed"))
+                retrieved = _parse_utc(item["retrieved_at"])
+                batches.append(AcquisitionBatch.create(sensor_id=sensor_id, requested_interval_start=start,
+                    requested_interval_end=end, retrieved_at=retrieved, source_endpoint=item["endpoint"],
+                    http_status=item["http_status"], raw_payload_sha256=item["raw_payload_sha256"], records=records,
+                    normalized_payload_sha256=digest, created_at=retrieved))
+            except OpenAQError as error:
+                reason = SourceParseError if "invalid JSON" in str(error) or "results is not" in str(error) else SourceTransportError
+                raise reason(str(error)) from error
+            except SourceParseError:
+                raise
+            except (InvalidOperation, KeyError, TypeError, ValueError) as error:
+                raise SourceParseError(str(error)) from error
+            if len(rows) < self.limit:
+                break
+            if page >= self.max_pages:
+                raise SourceTransportError("OpenAQ page limit exceeded")
+            page += 1
+        return batches[0] if len(batches) == 1 else tuple(batches)
 
 
 def _parse_utc(value):
@@ -48,11 +94,14 @@ def _cached(raw_directory, request):
         return None
 
 
-def _request(client, api_key, path, params, raw_directory, sensor_id=None, sleep=time.sleep, now=lambda: datetime.now(UTC)):
+def _request(client, api_key, path, params, raw_directory, sensor_id=None, sleep=time.sleep, now=lambda: datetime.now(UTC), preserve_decimal=False):
     raw_directory.mkdir(parents=True, exist_ok=True)
     request = {"endpoint": path, "sensor_id": sensor_id, "page": params.get("page"), "limit": params.get("limit"), "datetime_from": params.get("datetime_from"), "datetime_to": params.get("datetime_to")}
     cached = _cached(raw_directory, request)
     if cached:
+        if preserve_decimal:
+            provenance = cached[1]
+            return json.loads(Path(provenance["raw_payload_path"]).read_bytes(), parse_float=Decimal), provenance
         return cached
     for attempt in range(4):
         try:
@@ -78,7 +127,7 @@ def _request(client, api_key, path, params, raw_directory, sensor_id=None, sleep
         provenance = {**request, "retrieved_at": now().astimezone(UTC).isoformat(), "http_status": response.status_code, "raw_payload_path": str(payload_path), "raw_payload_sha256": digest}
         (raw_directory / f"{_cache_key(request)}.provenance.json").write_text(json.dumps(provenance, sort_keys=True))
         try:
-            return json.loads(payload), provenance
+            return json.loads(payload, parse_float=Decimal) if preserve_decimal else json.loads(payload), provenance
         except ValueError as error:
             raise OpenAQError("OpenAQ returned invalid JSON") from error
     raise OpenAQError("OpenAQ request failed")
@@ -112,20 +161,58 @@ def sensor_history_chunks_for_coverage(client, api_key, metadata, raw_directory,
     return sensor_history_chunks(enrich_sensor_metadata(client, api_key, metadata, raw_directory, sleep, now))
 
 
-def normalize_measurement(row, sensor_id):
+def normalize_measurement_for_reconciliation(row, sensor_id):
+    try:
+        return normalize_measurement(row, sensor_id, True)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        record = {"malformed": True}
+        if isinstance(row, dict):
+            if type(row.get("sensor_id")) is int:
+                record["sensor_id"] = row["sensor_id"]
+            period = row.get("period")
+            if isinstance(period, dict):
+                start = period.get("datetimeFrom")
+                if isinstance(start, dict) and isinstance(start.get("utc"), str):
+                    try:
+                        record["event_time"] = _parse_utc(start["utc"])
+                    except ValueError:
+                        pass
+                end = period.get("datetimeTo")
+                if isinstance(end, dict) and isinstance(end.get("utc"), str):
+                    try:
+                        record["period_end_utc"] = _parse_utc(end["utc"])
+                    except ValueError:
+                        pass
+            if "value" in row:
+                try:
+                    record["value_decimal"] = row["value"] if isinstance(row["value"], Decimal) else Decimal(row["value"])
+                except (InvalidOperation, TypeError, ValueError):
+                    pass
+            if isinstance(row.get("parameter"), dict):
+                record["unit"] = row["parameter"].get("units")
+            if "id" in row:
+                record["record_id"] = row["id"]
+        return record
+
+
+def normalize_measurement(row, sensor_id, preserve_decimal=False):
     period = row["period"]
-    return {"sensor_id": sensor_id, "event_time": _parse_utc(period["datetimeFrom"]["utc"]), "period_end_utc": _parse_utc(period["datetimeTo"]["utc"]), "value": row.get("value"), "unit": row.get("parameter", {}).get("units"), "record_id": row.get("id")}
+    source_sensor_id = row.get("sensor_id", sensor_id)
+    record = {"sensor_id": source_sensor_id, "event_time": _parse_utc(period["datetimeFrom"]["utc"]), "period_end_utc": _parse_utc(period["datetimeTo"]["utc"]), "value": row.get("value"), "unit": row.get("parameter", {}).get("units"), "record_id": row.get("id")}
+    if preserve_decimal:
+        record["value_decimal"] = row.get("value")
+    return record
 
 
-def fetch_hours(client, api_key, sensor_id, start, end, raw_directory, limit=1000, sleep=time.sleep, now=lambda: datetime.now(UTC)):
+def fetch_hours(client, api_key, sensor_id, start, end, raw_directory, limit=1000, sleep=time.sleep, now=lambda: datetime.now(UTC), preserve_decimal=False):
     records, provenance, page = [], [], 1
     while True:
         params = {"datetime_from": start.isoformat(), "datetime_to": end.isoformat(), "limit": limit, "page": page}
-        payload, item = _request(client, api_key, f"/sensors/{sensor_id}/hours", params, raw_directory, sensor_id, sleep, now)
+        payload, item = _request(client, api_key, f"/sensors/{sensor_id}/hours", params, raw_directory, sensor_id, sleep, now, preserve_decimal)
         rows = payload.get("results", [])
         if not isinstance(rows, list):
             raise OpenAQError("OpenAQ results is not a list")
-        records.extend(normalize_measurement(row, sensor_id) for row in rows)
+        records.extend(normalize_measurement(row, sensor_id, preserve_decimal) for row in rows)
         provenance.append(item)
         if len(rows) < limit:
             break

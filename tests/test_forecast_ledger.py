@@ -125,7 +125,7 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertEqual(result.status, "inserted")
         self.assertEqual(SQLiteForecastStore(self.database).latest(), self.record)
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
 
     def test_identical_insert_is_idempotent_but_conflict_never_overwrites(self):
         store = SQLiteForecastStore(self.database)
