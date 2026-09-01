@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 WorkingDirectory=@REPO_ROOT@
 EnvironmentFile=-%h/.config/airaware/airaware.env
+Environment=AIRAWARE_SYSTEMD_MONITORING_ENABLED=1
 ExecStart=@REPO_ROOT@/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=5s
@@ -13,6 +14,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+ReadOnlyPaths=@REPO_ROOT@/.artifacts/ledger
 
 [Install]
 WantedBy=default.target

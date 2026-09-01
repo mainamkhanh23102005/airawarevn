@@ -11,7 +11,7 @@ from typing import Annotated
 
 import httpx
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -126,6 +126,36 @@ class StatusResponse(BaseModel):
     sensor_id: int | None = None
     current_forecast_available: bool
     data_mode: str
+
+
+class ForecastPerformanceMetricsResponse(BaseModel):
+    model_mae: float | None
+    model_rmse: float | None
+    persistence_mae: float | None
+    persistence_rmse: float | None
+    mae_improvement: float | None
+    rmse_improvement: float | None
+    mae_improvement_percent: float | None
+    rmse_improvement_percent: float | None
+
+
+class ForecastPerformanceResponse(BaseModel):
+    available: bool
+    count: int
+    model_version: str
+    model_artifact_sha256: str
+    feature_schema_sha256: str
+    sensor_id: int
+    start_utc: datetime
+    end_utc: datetime
+    evaluation_policy_version: int | None
+    snapshot_id: str | None
+    snapshot_created_at: datetime | None
+    metrics: ForecastPerformanceMetricsResponse | None
+
+
+REPORTING_UNAVAILABLE_DETAIL = "Forecast performance reporting is unavailable."
+REPORTING_INVALID_DETAIL = "Forecast performance request is invalid."
 
 
 def _validate_metadata(metadata):
@@ -336,7 +366,6 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         or os.environ.get("AIRAWARE_CURRENT_PM25_ARTIFACT_PATH", DEFAULT_CURRENT_PM25_ARTIFACT_PATH)
     )
     configured_ledger_path = forecast_ledger_path or os.environ.get("AIRAWARE_FORECAST_LEDGER_PATH")
-
     @asynccontextmanager
     async def lifespan(application):
         model, metadata = load_artifact(configured_path)
@@ -347,8 +376,18 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         application.state.current_pm25_artifact_path = configured_current_pm25_path
         application.state.forecast_store = None
         if configured_ledger_path:
-            application.state.forecast_store = SQLiteForecastStore(configured_ledger_path)
-            application.state.forecast_store.initialize()
+            systemd_monitoring = os.environ.get("AIRAWARE_SYSTEMD_MONITORING_ENABLED") == "1"
+            store = SQLiteForecastStore(configured_ledger_path, read_only=systemd_monitoring)
+            if systemd_monitoring:
+                try:
+                    store.validate_existing()
+                except (OSError, RuntimeError, sqlite3.Error):
+                    logger.exception("Systemd API ledger validation failed")
+                else:
+                    application.state.forecast_store = store
+            else:
+                store.initialize()
+                application.state.forecast_store = store
         refresh_task = None
         if os.environ.get("AIRAWARE_REFRESH_ENABLED") == "1":
             api_key = os.environ.get("OPENAQ_API_KEY")
@@ -383,6 +422,49 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
             model_version=MODEL_VERSION,
             forecast_horizon_hours=FORECAST_HORIZON_HOURS,
         )
+
+    @application.get("/reporting/forecast-performance", response_model=ForecastPerformanceResponse)
+    def forecast_performance(request: Request, model_version: str = Query(min_length=1),
+                             model_artifact_sha256: str = Query(min_length=1),
+                             feature_schema_sha256: str = Query(min_length=1), sensor_id: int = Query(gt=0),
+                             start_utc: str = Query(), end_utc: str = Query()):
+        store = request.app.state.forecast_store
+        if store is None:
+            raise HTTPException(status_code=503, detail=REPORTING_UNAVAILABLE_DETAIL)
+        try:
+            def parse_utc(value):
+                if not value.endswith("Z"):
+                    raise ValueError("timestamps must use canonical UTC")
+                parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+                if parsed.utcoffset() != timedelta(0) or parsed.microsecond:
+                    raise ValueError("timestamps must use canonical UTC seconds")
+                return parsed.astimezone(timezone.utc)
+            start_utc = parse_utc(start_utc)
+            end_utc = parse_utc(end_utc)
+            requested = {
+                "model_version": model_version,
+                "model_artifact_sha256": model_artifact_sha256,
+                "feature_schema_sha256": feature_schema_sha256,
+                "sensor_id": sensor_id,
+                "start_utc": start_utc,
+                "end_utc": end_utc,
+            }
+            snapshot = store.find_evaluation_run_snapshot(model_version, model_artifact_sha256,
+                feature_schema_sha256, sensor_id, start_utc, end_utc)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=REPORTING_INVALID_DETAIL) from error
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=REPORTING_UNAVAILABLE_DETAIL) from error
+        if snapshot is None:
+            return ForecastPerformanceResponse(available=False, count=0, evaluation_policy_version=1,
+                snapshot_id=None, snapshot_created_at=None, metrics=None, **requested)
+        metrics = ForecastPerformanceMetricsResponse(**snapshot.metrics.__dict__)
+        return ForecastPerformanceResponse(available=True, count=snapshot.metrics.count,
+            model_version=snapshot.model_version, model_artifact_sha256=snapshot.model_artifact_sha256,
+            feature_schema_sha256=snapshot.feature_schema_sha256, sensor_id=snapshot.sensor_id,
+            start_utc=snapshot.target_interval_end_start, end_utc=snapshot.target_interval_end_end,
+            evaluation_policy_version=snapshot.evaluation_policy_version, snapshot_id=snapshot.snapshot_id,
+            snapshot_created_at=snapshot.created_at, metrics=metrics)
 
     @application.post("/predict", response_model=PredictionResponse)
     def predict(payload: PredictionRequest, request: Request):

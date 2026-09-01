@@ -3,6 +3,14 @@
 
 # Secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
 
 # Python caches
 __pycache__/
@@ -24,6 +32,8 @@ dist/
 .artifacts/live/
 .artifacts/models/
 .artifacts/forecast-ledger/
+.artifacts/ledger/
+.artifacts/reconciliation/
 *.sqlite3
 
 # OS and editor noise
