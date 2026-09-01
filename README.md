@@ -209,6 +209,7 @@ Repository-managed templates live in `deploy/systemd/`. Install rendered user un
 python -m scripts.install_systemd_user
 systemctl --user daemon-reload
 systemctl --user enable --now airaware-refresh.timer
+systemctl --user enable --now airaware-monitoring.timer
 systemctl --user enable --now airaware-api.service
 ```
 
@@ -216,7 +217,11 @@ Components:
 
 - `airaware-refresh.timer`: persistent hourly schedule at approximately `HH:12`;
 - `airaware-refresh.service`: oneshot data refresh with restricted write access to `.artifacts/live`;
+- `airaware-monitoring.timer`: persistent hourly M1 issuance, M2 reconciliation, M3 materialization, and immutable snapshot cycle;
+- `airaware-monitoring.service`: one oneshot worker. Set `AIRAWARE_FORECAST_LEDGER_PATH=.artifacts/ledger/forecasts.sqlite3` and `AIRAWARE_RECONCILIATION_RAW_DIRECTORY=.artifacts/reconciliation` in `~/.config/airaware/airaware.env`; it alone writes ledger and raw evidence;
 - `airaware-api.service`: Uvicorn without `--reload`, bound to `127.0.0.1:8000`, restarting on failure after five seconds.
+
+This local user-systemd path needs no paid infrastructure. Keep one monitoring timer enabled: SQLite `BEGIN IMMEDIATE` and deterministic issuer/snapshot identities make retries safe while avoiding concurrent worker scheduling. Render stays web-only because ephemeral storage and isolated services cannot provide durable shared ledger semantics.
 
 Useful checks:
 

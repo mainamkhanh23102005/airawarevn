@@ -1,0 +1,16 @@
+[Unit]
+Description=Run AirAware VN forecast issuance, reconciliation, and evaluation snapshots
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+EnvironmentFile=%h/.config/airaware/airaware.env
+ExecStart=@REPO_ROOT@/.venv/bin/python -m scripts.run_monitoring_cycle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@REPO_ROOT@/.artifacts/ledger @REPO_ROOT@/.artifacts/reconciliation

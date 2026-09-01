@@ -9,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVICE_TEMPLATE = ROOT / "deploy/systemd/airaware-refresh.service"
 TIMER_TEMPLATE = ROOT / "deploy/systemd/airaware-refresh.timer"
 API_SERVICE_TEMPLATE = ROOT / "deploy/systemd/airaware-api.service"
+MONITORING_SERVICE_TEMPLATE = ROOT / "deploy/systemd/airaware-monitoring.service"
+MONITORING_TIMER_TEMPLATE = ROOT / "deploy/systemd/airaware-monitoring.timer"
 
 
 class SystemdDeploymentTests(unittest.TestCase):
@@ -28,6 +30,16 @@ class SystemdDeploymentTests(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
         self.assertIn("Unit=airaware-refresh.service", timer)
 
+    def test_monitoring_cycle_uses_one_oneshot_worker_with_durable_paths(self):
+        service = MONITORING_SERVICE_TEMPLATE.read_text(encoding="utf-8")
+        timer = MONITORING_TIMER_TEMPLATE.read_text(encoding="utf-8")
+        self.assertIn("ExecStart=@REPO_ROOT@/.venv/bin/python -m scripts.run_monitoring_cycle", service)
+        self.assertIn("ReadWritePaths=@REPO_ROOT@/.artifacts/ledger @REPO_ROOT@/.artifacts/reconciliation", service)
+        self.assertNotIn(".artifacts/live", service)
+        self.assertIn("OnCalendar=*-*-* *:15:00", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=airaware-monitoring.service", timer)
+
     def test_api_service_uses_production_module_invocation_and_restart_policy(self):
         service = API_SERVICE_TEMPLATE.read_text(encoding="utf-8")
 
@@ -36,6 +48,9 @@ class SystemdDeploymentTests(unittest.TestCase):
         self.assertNotIn("--reload", service)
         self.assertIn("Restart=on-failure", service)
         self.assertIn("RestartSec=5s", service)
+        self.assertIn("Environment=AIRAWARE_SYSTEMD_MONITORING_ENABLED=1", service)
+        self.assertIn("ReadOnlyPaths=@REPO_ROOT@/.artifacts/ledger", service)
+        self.assertNotIn("ReadWritePaths=@REPO_ROOT@/.artifacts/ledger", service)
         self.assertIn("WantedBy=default.target", service)
         self.assertNotIn("OPENAQ_API_KEY=", service)
 
@@ -47,13 +62,16 @@ class SystemdDeploymentTests(unittest.TestCase):
             service = (destination / "airaware-refresh.service").read_text(encoding="utf-8")
             timer = (destination / "airaware-refresh.timer").read_text(encoding="utf-8")
             api_service = (destination / "airaware-api.service").read_text(encoding="utf-8")
+            monitoring_service = (destination / "airaware-monitoring.service").read_text(encoding="utf-8")
+            monitoring_timer = (destination / "airaware-monitoring.timer").read_text(encoding="utf-8")
 
-        self.assertEqual(set(installed), {destination / "airaware-refresh.service", destination / "airaware-refresh.timer", destination / "airaware-api.service"})
+        self.assertEqual(set(installed), {destination / "airaware-refresh.service", destination / "airaware-refresh.timer", destination / "airaware-monitoring.service", destination / "airaware-monitoring.timer", destination / "airaware-api.service"})
         self.assertIn(f"WorkingDirectory={ROOT}", service)
         self.assertIn(f"WorkingDirectory={ROOT}", api_service)
         self.assertIn(f"ReadWritePaths={ROOT / '.artifacts/live'}", service)
-        self.assertNotIn("@REPO_ROOT@", service + timer + api_service)
-        self.assertNotIn("OPENAQ_API_KEY=", service + timer + api_service)
+        content = service + timer + monitoring_service + monitoring_timer + api_service
+        self.assertNotIn("@REPO_ROOT@", content)
+        self.assertNotIn("OPENAQ_API_KEY=", content)
 
     def test_installer_rejects_repository_paths_with_systemd_newlines(self):
         with tempfile.TemporaryDirectory() as directory:

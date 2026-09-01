@@ -57,7 +57,7 @@ class ReconciliationTests(unittest.TestCase):
         store = SQLiteForecastStore(self.database)
         store.initialize()
         with store._connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions"} <= tables)
@@ -78,7 +78,7 @@ class ReconciliationTests(unittest.TestCase):
             before_row = connection.execute("SELECT * FROM forecasts").fetchone()
         store.initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertEqual(connection.execute("SELECT sql FROM sqlite_master WHERE name='forecasts'").fetchone()[0], before_sql)
             self.assertEqual(connection.execute("SELECT * FROM forecasts").fetchone(), before_row)
 
@@ -137,11 +137,34 @@ class ReconciliationTests(unittest.TestCase):
             SQLiteForecastStore(self.database).initialize()
         with sqlite3.connect(self.database) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
-            connection.execute("PRAGMA user_version=3")
+            connection.execute("PRAGMA user_version=8")
         with self.assertRaisesRegex(RuntimeError, "unsupported schema version"):
             SQLiteForecastStore(self.database).initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+
+    def test_v6_cursor_migration_rebuilds_legacy_incomplete_backfill(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DELETE FROM evaluation_cohort_cursors")
+            connection.execute("PRAGMA user_version=6")
+        store.initialize()
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+
+    def test_v5_migration_rejects_missing_current_window_index(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP INDEX evaluation_rows_current_window_idx")
+            connection.execute("DROP TABLE evaluation_cohort_cursors")
+            connection.execute("PRAGMA user_version=5")
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
+            store.initialize()
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_cohort_cursors'").fetchone())
 
     def test_failed_migration_rolls_back_tables_and_version(self):
         store = self._create_v1()

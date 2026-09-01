@@ -1,10 +1,12 @@
 import asyncio
 import json
 import math
+import os
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,8 +15,10 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 from app import main
+from app.evaluation_monitor import materialize_available_evaluations
 from app.main import create_app
 from app.forecast_ledger import ForecastRecord, SQLiteForecastStore
+from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 from scripts.modeling.features import V1_FEATURE_COLUMNS, build_v1_features
 from scripts.modeling.predict import predict_pm25_t_plus_6
 from scripts.modeling.train import save_artifact, train_v1_model
@@ -550,6 +554,28 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["predicted_pm25"], 42.5)
 
+    def test_systemd_monitoring_api_validates_existing_ledger_without_initializing_or_writing(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        writer = SQLiteForecastStore(database); writer.initialize(); writer.insert(self.ledger_record())
+        with patch.dict(os.environ, {"AIRAWARE_SYSTEMD_MONITORING_ENABLED": "1"}), patch.object(
+                SQLiteForecastStore, "initialize", side_effect=AssertionError("API must not initialize ledger")) as initialize, patch.object(
+                SQLiteForecastStore, "insert", side_effect=AssertionError("API must not write ledger")):
+            with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+                response = client.get("/forecast/current")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["predicted_pm25"], 42.5)
+        initialize.assert_not_called()
+
+    def test_systemd_monitoring_api_missing_ledger_remains_unavailable_without_creating_it(self):
+        database = Path(self.directory.name) / "missing" / "ledger.sqlite3"
+        with patch.dict(os.environ, {"AIRAWARE_SYSTEMD_MONITORING_ENABLED": "1"}), patch.object(
+                SQLiteForecastStore, "initialize", side_effect=AssertionError("API must not initialize ledger")) as initialize:
+            with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+                response = client.get("/forecast/current")
+        self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast source is unavailable."}))
+        self.assertFalse(database.parent.exists())
+        initialize.assert_not_called()
+
     def test_enabled_current_recomputes_request_state_without_mutating_issuance(self):
         database = Path(self.directory.name) / "ledger.sqlite3"
         record = self.ledger_record(); store = SQLiteForecastStore(database); store.initialize(); store.insert(record)
@@ -603,6 +629,192 @@ class ApiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match V1 contract"):
             with self.client(incompatible_path):
                 pass
+
+    def _performance_snapshot(self, database):
+        store = SQLiteForecastStore(database)
+        store.initialize()
+        record = self.ledger_record()
+        store.insert(record)
+        batch = AcquisitionBatch.create(sensor_id=record.sensor_id, requested_interval_start=record.target_interval_start,
+            requested_interval_end=record.target_interval_end, retrieved_at=record.target_interval_end + timedelta(hours=2),
+            source_endpoint="/sensors/13502151/hours", http_status=200, raw_payload_sha256="c" * 64,
+            normalized_payload_sha256="d" * 64, created_at=record.target_interval_end + timedelta(hours=2), records=[{
+                "sensor_id": record.sensor_id, "event_time": record.target_interval_start,
+                "period_end_utc": record.target_interval_end, "value_decimal": Decimal("40"),
+                "unit": "µg/m³", "record_id": 1}])
+        GroundTruthReconciler(store, now=lambda: record.target_interval_end + timedelta(hours=2)).reconcile(record, batch)
+        store.materialize_evaluation(record.forecast_id)
+        return store, record, store.create_evaluation_run_snapshot(record.model_version,
+            record.model_artifact_sha256, record.feature_schema_sha256, record.sensor_id,
+            record.target_interval_end, record.target_interval_end + timedelta(hours=1),
+            record.target_interval_end + timedelta(hours=3)).snapshot
+
+    def _performance_params(self, record):
+        return {"model_version": record.model_version, "model_artifact_sha256": record.model_artifact_sha256,
+            "feature_schema_sha256": record.feature_schema_sha256, "sensor_id": record.sensor_id,
+            "start_utc": record.target_interval_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_utc": (record.target_interval_end + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    def test_forecast_performance_returns_immutable_snapshot_metrics(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store, record, snapshot = self._performance_snapshot(database)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/reporting/forecast-performance", params=self._performance_params(record))
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["available"], body["count"], body["snapshot_id"]), (True, 1, snapshot.snapshot_id))
+        self.assertEqual(body["evaluation_policy_version"], 1)
+        self.assertEqual(body["metrics"]["model_mae"], 2.5)
+        self.assertEqual(store.count_evaluations(), 1)
+
+    def test_forecast_performance_uses_current_membership_snapshot_after_later_in_window_evaluation(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store, record, _ = self._performance_snapshot(database)
+        initial = store.create_evaluation_run_snapshot(record.model_version, record.model_artifact_sha256,
+            record.feature_schema_sha256, record.sensor_id, record.target_interval_end,
+            record.target_interval_end + timedelta(hours=2), record.target_interval_end + timedelta(hours=3)).snapshot
+        later = ForecastRecord.create(sensor_id=record.sensor_id, prediction_time=record.prediction_time + timedelta(hours=1),
+            predicted_pm25=43.5, persistence_prediction=25.0, model_version=record.model_version,
+            model_artifact_sha256=record.model_artifact_sha256, feature_schema_sha256=record.feature_schema_sha256,
+            artifact_version=record.artifact_version, feature_configuration=record.feature_configuration,
+            source_retrieved_at=record.source_retrieved_at + timedelta(hours=1),
+            input_data_cutoff=record.input_data_cutoff + timedelta(hours=1),
+            history_start=record.history_start + timedelta(hours=1), history_end=record.history_end + timedelta(hours=1),
+            data_mode_at_issue=record.data_mode_at_issue, freshness_status_at_issue=record.freshness_status_at_issue,
+            source_age_minutes_at_issue=record.source_age_minutes_at_issue, issued_at=record.issued_at + timedelta(hours=1))
+        store.insert(later)
+        batch = AcquisitionBatch.create(sensor_id=later.sensor_id, requested_interval_start=later.target_interval_start,
+            requested_interval_end=later.target_interval_end, retrieved_at=later.target_interval_end + timedelta(hours=2),
+            source_endpoint="/sensors/13502151/hours", http_status=200, raw_payload_sha256="e" * 64,
+            normalized_payload_sha256="f" * 64, created_at=later.target_interval_end + timedelta(hours=2), records=[{
+                "sensor_id": later.sensor_id, "event_time": later.target_interval_start,
+                "period_end_utc": later.target_interval_end, "value_decimal": Decimal("41"), "unit": "µg/m³", "record_id": 2}])
+        GroundTruthReconciler(store, now=lambda: later.target_interval_end + timedelta(hours=2)).reconcile(later, batch)
+        store.materialize_evaluation(later.forecast_id)
+        later_snapshot = store.create_evaluation_run_snapshot(record.model_version, record.model_artifact_sha256,
+            record.feature_schema_sha256, record.sensor_id, record.target_interval_end,
+            record.target_interval_end + timedelta(hours=2), record.target_interval_end + timedelta(hours=4)).snapshot
+        self.assertNotEqual(initial.snapshot_id, later_snapshot.snapshot_id)
+        params = {**self._performance_params(record), "end_utc": (record.target_interval_end + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/reporting/forecast-performance", params=params)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["snapshot_id"], later_snapshot.snapshot_id)
+        self.assertEqual(response.json()["count"], 2)
+
+    def test_forecast_performance_is_unavailable_until_monitor_replaces_stale_snapshot(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store, record, _ = self._performance_snapshot(database)
+        initial = store.create_evaluation_run_snapshot(record.model_version, record.model_artifact_sha256,
+            record.feature_schema_sha256, record.sensor_id, record.target_interval_end,
+            record.target_interval_end + timedelta(hours=2), record.target_interval_end + timedelta(hours=3)).snapshot
+        later = ForecastRecord.create(sensor_id=record.sensor_id, prediction_time=record.prediction_time + timedelta(hours=1),
+            predicted_pm25=43.5, persistence_prediction=25.0, model_version=record.model_version,
+            model_artifact_sha256=record.model_artifact_sha256, feature_schema_sha256=record.feature_schema_sha256,
+            artifact_version=record.artifact_version, feature_configuration=record.feature_configuration,
+            source_retrieved_at=record.source_retrieved_at + timedelta(hours=1),
+            input_data_cutoff=record.input_data_cutoff + timedelta(hours=1),
+            history_start=record.history_start + timedelta(hours=1), history_end=record.history_end + timedelta(hours=1),
+            data_mode_at_issue=record.data_mode_at_issue, freshness_status_at_issue=record.freshness_status_at_issue,
+            source_age_minutes_at_issue=record.source_age_minutes_at_issue, issued_at=record.issued_at + timedelta(hours=1))
+        store.insert(later)
+        batch = AcquisitionBatch.create(sensor_id=later.sensor_id, requested_interval_start=later.target_interval_start,
+            requested_interval_end=later.target_interval_end, retrieved_at=later.target_interval_end + timedelta(hours=2),
+            source_endpoint="/sensors/13502151/hours", http_status=200, raw_payload_sha256="e" * 64,
+            normalized_payload_sha256="f" * 64, created_at=later.target_interval_end + timedelta(hours=2), records=[{
+            "sensor_id": later.sensor_id, "event_time": later.target_interval_start,
+            "period_end_utc": later.target_interval_end, "value_decimal": Decimal("41"), "unit": "µg/m³", "record_id": 2}])
+        GroundTruthReconciler(store, now=lambda: later.target_interval_end + timedelta(hours=2)).reconcile(later, batch)
+        store.materialize_evaluation(later.forecast_id)
+        params = {**self._performance_params(record), "end_utc": (record.target_interval_end + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            unavailable = client.get("/reporting/forecast-performance", params=params)
+        self.assertEqual(unavailable.status_code, 200)
+        self.assertEqual(unavailable.json(), {**params, "available": False, "count": 0,
+            "evaluation_policy_version": 1, "snapshot_id": None, "snapshot_created_at": None, "metrics": None})
+        self.assertEqual(store.find_evaluation_run_snapshot(record.model_version, record.model_artifact_sha256,
+            record.feature_schema_sha256, record.sensor_id, record.target_interval_end,
+            record.target_interval_end + timedelta(hours=2)), None)
+        materialize_available_evaluations(store)
+        replacement = store.find_evaluation_run_snapshot(record.model_version, record.model_artifact_sha256,
+            record.feature_schema_sha256, record.sensor_id, record.target_interval_end,
+            record.target_interval_end + timedelta(hours=2))
+        self.assertNotEqual(replacement.snapshot_id, initial.snapshot_id)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            current = client.get("/reporting/forecast-performance", params=params)
+        self.assertEqual((current.status_code, current.json()["available"], current.json()["count"], current.json()["snapshot_id"]),
+            (200, True, 2, replacement.snapshot_id))
+
+    def test_forecast_performance_empty_snapshot_retains_filters(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store = SQLiteForecastStore(database)
+        store.initialize()
+        record = self.ledger_record()
+        params = self._performance_params(record)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/reporting/forecast-performance", params=params)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {**params, "start_utc": params["start_utc"].replace("+00:00", "Z"), "end_utc": params["end_utc"].replace("+00:00", "Z"), "available": False, "count": 0, "evaluation_policy_version": 1, "snapshot_id": None, "snapshot_created_at": None, "metrics": None})
+
+    def test_forecast_performance_empty_window_ignores_incompatible_cohort_outside_window(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        _, record, _ = self._performance_snapshot(database)
+        params = {**self._performance_params(record), "model_version": "v2",
+            "start_utc": (record.target_interval_end + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_utc": (record.target_interval_end + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/reporting/forecast-performance", params=params)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((response.json()["available"], response.json()["count"]), (False, 0))
+
+    def test_forecast_performance_rejects_incompatible_in_window_cohort_even_with_snapshot(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store, record, _ = self._performance_snapshot(database)
+        incompatible = ForecastRecord.create(sensor_id=record.sensor_id, prediction_time=record.prediction_time,
+            predicted_pm25=record.predicted_pm25, persistence_prediction=record.persistence_prediction,
+            model_version="v2", model_artifact_sha256="e" * 64, feature_schema_sha256="f" * 64,
+            artifact_version=record.artifact_version, feature_configuration=record.feature_configuration,
+            source_retrieved_at=record.source_retrieved_at, input_data_cutoff=record.input_data_cutoff,
+            history_start=record.history_start, history_end=record.history_end, data_mode_at_issue=record.data_mode_at_issue,
+            freshness_status_at_issue=record.freshness_status_at_issue, source_age_minutes_at_issue=record.source_age_minutes_at_issue,
+            issued_at=record.issued_at)
+        store.insert(incompatible)
+        batch = AcquisitionBatch.create(sensor_id=incompatible.sensor_id, requested_interval_start=incompatible.target_interval_start,
+            requested_interval_end=incompatible.target_interval_end, retrieved_at=incompatible.target_interval_end + timedelta(hours=2),
+            source_endpoint="/sensors/13502151/hours", http_status=200, raw_payload_sha256="e" * 64,
+            normalized_payload_sha256="f" * 64, created_at=incompatible.target_interval_end + timedelta(hours=2), records=[{
+                "sensor_id": incompatible.sensor_id, "event_time": incompatible.target_interval_start,
+                "period_end_utc": incompatible.target_interval_end, "value_decimal": Decimal("40"),
+                "unit": "µg/m³", "record_id": 2}])
+        GroundTruthReconciler(store, now=lambda: incompatible.target_interval_end + timedelta(hours=2)).reconcile(incompatible, batch)
+        store.materialize_evaluation(incompatible.forecast_id)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/reporting/forecast-performance", params=self._performance_params(record))
+        self.assertEqual(response.status_code, 422)
+
+    def test_forecast_performance_rejects_noncanonical_utc_query_values(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        _, record, _ = self._performance_snapshot(database)
+        params = self._performance_params(record)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            for value in ("2025-02-02T07:00:00+00:00", "2025-02-02T07:00:00+07:00", "2025-02-02T07:00:00Z.1"):
+                response = client.get("/reporting/forecast-performance", params={**params, "start_utc": value})
+                self.assertEqual((response.status_code, response.json()), (422, {"detail": "Forecast performance request is invalid."}))
+
+    def test_forecast_performance_rejects_invalid_windows_and_sanitizes_failures(self):
+        database = Path(self.directory.name) / "private-ledger.sqlite3"
+        _, record, _ = self._performance_snapshot(database)
+        params = self._performance_params(record)
+        cases = ({**params, "start_utc": "2025-02-02T07:30:00Z"}, {**params, "end_utc": params["start_utc"]},
+            {**params, "model_artifact_sha256": "c" * 64})
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            for invalid in cases:
+                self.assertEqual(client.get("/reporting/forecast-performance", params=invalid).status_code, 422)
+        with patch("app.forecast_ledger.SQLiteForecastStore.find_evaluation_run_snapshot", side_effect=sqlite3.OperationalError(f"SQL {database}")):
+            with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+                response = client.get("/reporting/forecast-performance", params=params)
+        self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast performance reporting is unavailable."}))
+        self.assertNotIn(str(database), response.text)
 
 
 class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):
