@@ -10,119 +10,249 @@
     main { width: min(44rem, calc(100% - 2rem)); margin: 0 auto; padding: 3rem 0; }
     header { border-bottom: 1px solid #cbd7d0; padding-bottom: 1.5rem; }
     h1 { margin: 0; font-size: 2rem; }
-    .mode { color: #4b6155; margin: .5rem 0 0; }
-    .status { min-height: 1.5rem; margin: 1.5rem 0; }
-    .readings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .subtitle { color: #4b6155; margin: .5rem 0 0; }
+    #forecast { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin-top: 1.5rem; }
     section { background: #fff; border: 1px solid #cbd7d0; padding: 1.25rem; }
     h2 { margin: 0 0 .5rem; font-size: 1rem; color: #4b6155; }
     .value { margin: 0; font-size: 2rem; font-weight: 700; }
-    dl { display: grid; grid-template-columns: max-content 1fr; gap: .75rem 1rem; margin: 1rem 0 0; }
-    dt { color: #4b6155; }
-    dd { margin: 0; overflow-wrap: anywhere; }
+    .note { margin: .5rem 0 0; color: #4b6155; }
+    .change { margin: .5rem 0 0; font-size: 1.05rem; }
+    .full { grid-column: 1 / -1; }
+    #status { min-height: 1.5rem; margin: 1.5rem 0 0; }
     button { margin-top: 1.5rem; border: 0; background: #176b45; color: white; padding: .75rem 1rem; font: inherit; font-weight: 700; cursor: pointer; }
     button:focus-visible { outline: 3px solid #17211c; outline-offset: 3px; }
     button:disabled { cursor: wait; opacity: .65; }
-    @media (max-width: 32rem) { .readings { grid-template-columns: 1fr; } dl { grid-template-columns: 1fr; gap: .25rem; } dd { margin-bottom: .5rem; } }
+    @media (max-width: 32rem) { #forecast { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <main>
     <header>
       <h1>AirAware VN</h1>
-      <p class="mode">Live 6-hour PM2.5 forecast from OpenAQ observations.</p>
+      <p class="subtitle">Live 6-hour PM2.5 forecast for Hanoi.</p>
     </header>
-    <section aria-labelledby="operational-status-title">
-      <h2 id="operational-status-title">AirAware status</h2>
-      <dl>
-        <dt>AirAware</dt><dd id="airaware-status">Loading…</dd>
-        <dt>OpenAQ data</dt><dd id="openaq-status">Loading…</dd>
-        <dt>Last retrieval</dt><dd id="last-retrieval">Unavailable</dd>
-        <dt>Data age</dt><dd id="data-age">Unavailable</dd>
-        <dt>Model</dt><dd id="model-status">V1 Linear Regression</dd>
-        <dt>Forecast horizon</dt><dd id="status-horizon">6 hours</dd>
-      </dl>
-    </section>
-    <p id="status" class="status" role="status" aria-live="polite">Loading forecast…</p>
-    <div id="forecast" aria-busy="true" hidden>
-      <div class="readings">
-        <section>
-          <h2>Latest completed PM2.5</h2>
-          <p class="value"><span id="latest-pm25"></span> <small>µg/m³</small></p>
-        </section>
-        <section>
-          <h2>V1 predicted PM2.5</h2>
-          <p class="value"><span id="predicted-pm25"></span> <small>µg/m³</small></p>
-        </section>
-      </div>
-      <section>
-        <h2>Forecast details</h2>
-        <dl>
-          <dt>Prediction time</dt><dd id="prediction-time"></dd>
-          <dt>Target interval</dt><dd id="target-interval"></dd>
-          <dt>Forecast horizon</dt><dd>6 hours</dd>
-          <dt>Data mode</dt><dd id="data-mode"></dd>
-          <dt>Data freshness</dt><dd id="freshness"></dd>
-        </dl>
+
+    <div id="forecast" aria-busy="true">
+      <section aria-labelledby="latest-title">
+        <h2 id="latest-title">Latest PM2.5</h2>
+        <p class="value"><span id="latest-pm25">—</span> <small>µg/m³</small></p>
+        <p id="observed-time" class="note">Observed: —</p>
+      </section>
+
+      <section aria-labelledby="forecast-title">
+        <h2 id="forecast-title">6-hour-ahead forecast</h2>
+        <p class="value"><span id="forecast-pm25">—</span> <small>µg/m³</small></p>
+        <p id="target-window" class="note">Expected: —</p>
+      </section>
+
+      <section class="full" aria-labelledby="change-title">
+        <h2 id="change-title">Expected change</h2>
+        <p id="expected-change" class="change">No forecast yet.</p>
+      </section>
+
+      <section class="full" aria-labelledby="freshness-title">
+        <h2 id="freshness-title">Data freshness</h2>
+        <p id="freshness" class="note">Unavailable.</p>
       </section>
     </div>
-    <button id="refresh" type="button">Refresh live forecast</button>
+
+    <p id="status" role="status" aria-live="polite" tabindex="-1">Loading forecast…</p>
+    <button id="refresh" type="button" aria-label="Refresh forecast">Refresh forecast</button>
   </main>
+
   <script>
-    const status = document.querySelector("#status");
-    const forecast = document.querySelector("#forecast");
-    const refresh = document.querySelector("#refresh");
-    const formatTime = value => new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+    (function (root) {
+      "use strict";
+      var ICT_TIME_ZONE = "Asia/Ho_Chi_Minh";
+      var timeFormatter = new Intl.DateTimeFormat("en-GB", {
+        timeZone: ICT_TIME_ZONE,
+        year: "numeric",
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
 
-    async function loadStatus() {
-      try {
-        const response = await fetch("/status");
-        if (!response.ok) throw new Error(`Status unavailable (${response.status})`);
-        const data = await response.json();
-        document.querySelector("#airaware-status").textContent = data.overall_status;
-        document.querySelector("#openaq-status").textContent = data.freshness_status;
-        document.querySelector("#last-retrieval").textContent = data.source_retrieved_at ? formatTime(data.source_retrieved_at) : "Unavailable";
-        document.querySelector("#data-age").textContent = data.age_minutes === null ? "Unavailable" : `${data.age_minutes.toFixed(0)} minutes`;
-        document.querySelector("#model-status").textContent = `${data.model_version.toUpperCase()} ${data.model_type}`;
-        document.querySelector("#status-horizon").textContent = `${data.forecast_horizon_hours} hours`;
-      } catch (error) {
-        document.querySelector("#airaware-status").textContent = "Unavailable";
-        document.querySelector("#openaq-status").textContent = "Unavailable";
+      function formatIct(value) {
+        var date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "Unavailable";
+        return timeFormatter.format(date) + " ICT";
       }
-    }
 
-    async function loadForecast(endpoint = "/forecast/current") {
-      refresh.disabled = true;
-      forecast.setAttribute("aria-busy", "true");
-      status.textContent = forecast.hidden ? "Loading live forecast…" : "Refreshing live forecast…";
-      try {
-        const response = await fetch(endpoint);
-        if (!response.ok) throw new Error(`Forecast unavailable (${response.status})`);
-        const data = await response.json();
-        document.querySelector("#latest-pm25").textContent = data.latest_completed_pm25.toFixed(1);
-        document.querySelector("#predicted-pm25").textContent = data.predicted_pm25.toFixed(1);
-        document.querySelector("#prediction-time").textContent = formatTime(data.prediction_time);
-        document.querySelector("#target-interval").textContent = `${formatTime(data.target_interval_start)} – ${formatTime(data.target_interval_end)}`;
-        const modeLabels = {
-          fresh_openaq: "Fresh OpenAQ data",
-          stale_openaq: "Stale OpenAQ data",
+      function finiteValue(value) {
+        if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+        if (typeof value === "string" && value.trim() !== "") {
+          var parsed = Number(value);
+          return Number.isFinite(parsed) ? parsed : NaN;
+        }
+        return NaN;
+      }
+
+      function timestamp(value) {
+        if (value === null || value === undefined || value === "") return NaN;
+        var date = new Date(value);
+        return Number.isNaN(date.getTime()) ? NaN : date.getTime();
+      }
+
+      function buildModel(data) {
+        var source = data && typeof data === "object" ? data : {};
+        var latest = finiteValue(source.latest_completed_pm25);
+        var predicted = finiteValue(source.predicted_pm25);
+        if (!Number.isFinite(latest) || !Number.isFinite(predicted)) {
+          return { ok: false, reason: "invalid_pm25" };
+        }
+        var start = timestamp(source.target_interval_start);
+        var end = timestamp(source.target_interval_end);
+        if (Number.isNaN(start) || Number.isNaN(end)) {
+          return { ok: false, reason: "invalid_target" };
+        }
+        var observed = timestamp(source.history_end);
+        if (Number.isNaN(observed)) {
+          return { ok: false, reason: "invalid_history_end" };
+        }
+        var stale = source.freshness_status === "stale";
+        var age = finiteValue(source.age_minutes);
+        if (!stale && !Number.isFinite(age)) {
+          return { ok: false, reason: "invalid_age" };
+        }
+        return {
+          ok: true,
+          model: {
+            latest: latest,
+            predicted: predicted,
+            start: start,
+            end: end,
+            observed: observed,
+            stale: stale,
+            age: Number.isFinite(age) ? age : NaN,
+            horizonHours: 6,
+          },
         };
-        const modeLabel = modeLabels[data.data_mode] || "Live OpenAQ data";
-        document.querySelector("#data-mode").textContent = modeLabel;
-        document.querySelector("#freshness").textContent = `${data.freshness_status} (${data.age_minutes.toFixed(0)} minutes old)`;
-        status.textContent = `Live forecast loaded from ${modeLabel}. Status: ${data.freshness_status}.`;
-        forecast.hidden = false;
-      } catch (error) {
-        forecast.hidden = true;
-        status.textContent = "Live forecast unavailable. Previous readings hidden. Try refreshing shortly.";
-      } finally {
-        refresh.disabled = false;
-        forecast.setAttribute("aria-busy", "false");
-        await loadStatus();
       }
-    }
 
-    refresh.addEventListener("click", () => loadForecast("/forecast/current"));
-    loadForecast("/forecast/current");
+      function changeText(model) {
+        var delta = model.predicted - model.latest;
+        var rounded = Math.abs(delta).toFixed(1);
+        if (parseFloat(rounded) === 0) {
+          return "No meaningful change from the latest reading";
+        }
+        if (delta > 0) {
+          return "↑ About " + rounded + " µg/m³ higher than the latest reading";
+        }
+        return "↓ About " + rounded + " µg/m³ lower than the latest reading";
+      }
+
+      function observedText(model) {
+        return "Observed " + formatIct(model.observed);
+      }
+
+      function expectedText(model) {
+        return "Expected " + formatIct(model.start) + " – " + formatIct(model.end);
+      }
+
+      function freshnessText(model) {
+        if (model.stale) return "Data may be out of date.";
+        if (!Number.isFinite(model.age)) return "Updated time unknown";
+        return "Updated " + Math.max(0, Math.round(model.age)) + " minutes ago";
+      }
+
+      root.AirAwareView = {
+        formatIct: formatIct,
+        buildModel: buildModel,
+        changeText: changeText,
+        observedText: observedText,
+        expectedText: expectedText,
+        freshnessText: freshnessText,
+        ICT_TIME_ZONE: ICT_TIME_ZONE,
+        HORIZON_HOURS: 6,
+      };
+    })(typeof globalThis !== "undefined" ? globalThis : this);
+  </script>
+
+  <script>
+    (function () {
+      var view = window.AirAwareView;
+      var statusEl = document.querySelector("#status");
+      var forecastEl = document.querySelector("#forecast");
+      var refreshEl = document.querySelector("#refresh");
+      var latestEl = document.querySelector("#latest-pm25");
+      var observedEl = document.querySelector("#observed-time");
+      var forecastValEl = document.querySelector("#forecast-pm25");
+      var targetEl = document.querySelector("#target-window");
+      var changeEl = document.querySelector("#expected-change");
+      var freshnessEl = document.querySelector("#freshness");
+
+      var state = "loading";
+      var hasValidPrior = false;
+
+      function setBusy(busy) {
+        forecastEl.setAttribute("aria-busy", busy ? "true" : "false");
+        refreshEl.disabled = busy;
+      }
+
+      function showLoading() {
+        state = "loading";
+        setBusy(true);
+        statusEl.textContent = hasValidPrior ? "Refreshing forecast…" : "Loading forecast…";
+      }
+
+      function applyModel(model) {
+        var render = {
+          latest: model.latest.toFixed(1),
+          forecast: model.predicted.toFixed(1),
+          change: view.changeText(model),
+          observed: view.observedText(model),
+          expected: view.expectedText(model),
+          freshness: view.freshnessText(model),
+        };
+        latestEl.textContent = render.latest;
+        forecastValEl.textContent = render.forecast;
+        changeEl.textContent = render.change;
+        observedEl.textContent = render.observed;
+        targetEl.textContent = render.expected;
+        freshnessEl.textContent = render.freshness;
+        hasValidPrior = true;
+        state = "available";
+        setBusy(false);
+        statusEl.textContent = "Forecast updated.";
+      }
+
+      function showUnavailable() {
+        if (hasValidPrior) {
+          freshnessEl.textContent = "Data may be out of date.";
+          statusEl.textContent = "Forecast unavailable right now. Showing the most recent forecast we have.";
+        } else {
+          latestEl.textContent = "Unavailable";
+          observedEl.textContent = "Unavailable";
+          forecastValEl.textContent = "Unavailable";
+          targetEl.textContent = "Unavailable";
+          changeEl.textContent = "Forecast unavailable right now.";
+          freshnessEl.textContent = "Unavailable";
+          statusEl.textContent = "Forecast unavailable right now.";
+        }
+        state = "unavailable";
+        setBusy(false);
+      }
+
+      async function loadForecast() {
+        showLoading();
+        try {
+          var response = await fetch("/forecast/current");
+          if (!response.ok) throw new Error("Forecast unavailable right now");
+          var payload = await response.json();
+          var result = view.buildModel(payload);
+          if (!result.ok) throw new Error("Forecast unavailable right now");
+          applyModel(result.model);
+        } catch (error) {
+          showUnavailable();
+          statusEl.focus();
+        }
+      }
+
+      refreshEl.addEventListener("click", loadForecast);
+      window.AirAwareDom = { loadForecast: loadForecast };
+      loadForecast();
+    })();
   </script>
 </body>
 </html>
