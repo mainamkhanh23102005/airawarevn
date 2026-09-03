@@ -2,7 +2,10 @@ import asyncio
 import json
 import math
 import os
+import re
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -508,26 +511,323 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(body["current_forecast_available"])
         self.assertNotIn("sensitive internal failure", json.dumps(body))
 
-    def test_webpage_uses_live_forecast_without_historical_fallback(self):
+    def test_webpage_presents_consumer_layout(self):
         with self.client() as client:
             response = client.get("/")
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/html"))
         self.assertIn("AirAware VN", response.text)
-        self.assertIn("/status", response.text)
-        self.assertIn("AirAware status", response.text)
-        self.assertIn("OpenAQ data", response.text)
-        self.assertIn("Last retrieval", response.text)
-        self.assertIn('loadForecast("/forecast/current")', response.text)
-        self.assertNotIn('loadForecast("/forecast/latest")', response.text)
-        self.assertIn("Fresh OpenAQ data", response.text)
-        self.assertIn("Stale OpenAQ data", response.text)
-        self.assertIn('aria-busy="true"', response.text)
-        self.assertIn("forecast.hidden = true", response.text)
-        self.assertIn("Previous readings hidden", response.text)
+        self.assertIn("Latest PM2.5", response.text)
+        self.assertIn("6-hour-ahead forecast", response.text)
+        self.assertIn("Expected change", response.text)
+        self.assertIn("Data freshness", response.text)
+        self.assertIn("Refresh forecast", response.text)
+
+    def test_webpage_identifies_hanoi_as_forecast_city(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Hanoi", response.text)
+        self.assertNotIn("Ho Chi Minh City", response.text)
+
+    def test_webpage_does_not_expose_internal_status_details(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertNotIn("AirAware status", response.text)
+        self.assertNotIn("OpenAQ data", response.text)
+        self.assertNotIn("data_mode", response.text)
+        self.assertNotIn("model_version", response.text)
+        self.assertNotIn("forecast_horizon_hours", response.text)
+        self.assertNotIn("SQLite", response.text)
+        self.assertNotIn("sha256", response.text)
+        self.assertNotIn("worker", response.text)
+        self.assertNotIn('"/status"', response.text)
+
+    def test_webpage_uses_live_current_endpoint_without_historical_fallback(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn('"/forecast/current"', response.text)
+        self.assertNotIn('"/forecast/latest"', response.text)
         self.assertNotIn("body.detail", response.text)
         self.assertNotIn("error.message", response.text)
+
+    def test_webpage_formats_times_in_asia_ho_chi_minh_with_ict_label(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn("Asia/Ho_Chi_Minh", response.text)
+        self.assertIn("ICT", response.text)
+
+    def test_webpage_delta_logic_higher_lower_no_change_one_decimal(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn("higher than the latest reading", response.text)
+        self.assertIn("lower than the latest reading", response.text)
+        self.assertIn("No meaningful change from the latest reading", response.text)
+        self.assertIn(".toFixed(1)", response.text)
+        self.assertNotIn("exact", response.text)
+
+    def test_webpage_freshness_messages(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn("minutes ago", response.text)
+        self.assertIn("Data may be out of date.", response.text)
+
+    def test_webpage_freshness_guards_against_nonfinite_age(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn("Number.isFinite", response.text)
+        self.assertIn("age_minutes", response.text)
+        self.assertNotIn("NaN minutes ago", response.text)
+
+    def test_webpage_keeps_previous_forecast_on_failure_and_marks_out_of_date(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn("Data may be out of date.", response.text)
+        self.assertIn("Forecast unavailable right now", response.text)
+        self.assertNotIn("Previous readings hidden", response.text)
+
+    def test_webpage_no_forecast_curve(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertNotIn("<canvas", response.text)
+        self.assertNotIn("<svg", response.text)
+        self.assertNotIn("chart", response.text.lower())
+        self.assertNotIn("plotly", response.text.lower())
+        self.assertNotIn("d3", response.text.lower())
+
+    def test_webpage_a11y(self):
+        with self.client() as client:
+            response = client.get("/")
+
+        self.assertIn('role="status"', response.text)
+        self.assertIn('aria-live="polite"', response.text)
+        self.assertIn('aria-label="Refresh forecast"', response.text)
+        self.assertIn("aria-busy", response.text)
+        self.assertIn("<h2", response.text)
+
+    def webpage_scripts(self):
+        html = self.client().get("/").text
+        blocks = re.findall(r"<script>(.*?)</script>", html, re.S)
+        pure = next(block for block in blocks if "function buildModel" in block)
+        dom = next(block for block in blocks if "window.AirAwareDom" in block)
+        return pure, dom
+
+    def node_behaviors(self):
+        if not hasattr(self, "_node_behaviors_cache"):
+            self._node_behaviors_cache = self._run_node_behaviors()
+        return self._node_behaviors_cache
+
+    def _run_node_behaviors(self):
+        if shutil.which("node") is None:
+            self.skipTest("node not available; view-model logic not executed")
+        pure, dom = self.webpage_scripts()
+        harness = r"""
+const fs = require("fs"), vm = require("vm");
+const pure = fs.readFileSync(process.argv[2], "utf8");
+const dom = fs.readFileSync(process.argv[3], "utf8");
+function makeEl() { return { textContent: "", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, addEventListener() {}, focus() {} }; }
+function ok(p) { return { ok: true, status: 200, json: async () => p }; }
+function err() { return { ok: false, status: 503, json: async () => ({ detail: "Forecast source is unavailable." }) }; }
+function pump() { return new Promise(r => setTimeout(r, 0)); }
+async function build(queue) {
+  const sb = { console };
+  sb.window = sb;
+  const els = {};
+  sb.document = { querySelector(s) { return els[s] || (els[s] = makeEl()); } };
+  sb.fetch = async () => (queue.length ? queue.shift() : err());
+  vm.createContext(sb);
+  vm.runInContext(pure, sb);
+  vm.runInContext(dom, sb);
+  await pump();
+  sb.els = els;
+  return sb;
+}
+const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: "2025-02-02T06:00:00Z",
+  target_interval_end: "2025-02-02T07:00:00Z", forecast_horizon_hours: 6, predicted_pm25: 42.5,
+  unit: "µg/m³", model_version: "v1", latest_completed_pm25: 24.0, history_start: "2025-02-01T00:00:00Z",
+  history_end: "2025-02-02T00:00:00Z", data_mode: "fresh_openaq", source_retrieved_at: "2025-02-02T00:00:00Z",
+  sensor_id: 13502151, freshness_status: "fresh", age_minutes: 0 };
+(async () => {
+  const out = {};
+  const pureSb = { console };
+  pureSb.window = pureSb;
+  vm.createContext(pureSb);
+  vm.runInContext(pure, pureSb);
+  const V = pureSb.AirAwareView;
+  out.validModel = V.buildModel(VALID);
+  out.badAgeFresh = V.buildModel({ ...VALID, age_minutes: null });
+  out.badAgeNaN = V.buildModel({ ...VALID, age_minutes: "NaN" });
+  out.badAgeStale = V.buildModel({ ...VALID, freshness_status: "stale", age_minutes: null });
+  out.badPmNull = V.buildModel({ ...VALID, latest_completed_pm25: null });
+  out.badTarget = V.buildModel({ ...VALID, target_interval_start: null });
+  out.badHistoryEnd = V.buildModel({ ...VALID, history_end: "" });
+  out.ict = V.formatIct("2025-02-02T00:00:00Z");
+  out.ictInvalid = V.formatIct("not-a-date");
+  out.expected = V.expectedText({ start: Date.parse("2025-02-02T06:00:00Z"), end: Date.parse("2025-02-02T07:00:00Z") });
+  out.observed = V.observedText({ observed: Date.parse("2025-02-02T00:00:00Z") });
+  out.horizon = V.HORIZON_HOURS;
+  out.changeHigher = V.changeText({ latest: 10, predicted: 15 });
+  out.changeLower = V.changeText({ latest: 15, predicted: 10 });
+  out.changeNone = V.changeText({ latest: 10, predicted: 10 });
+  {
+    const sb = await build([ok(VALID)]);
+    out.validWhole = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
+      observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
+      freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
+      busy: sb.els["#forecast"].attrs["aria-busy"] };
+  }
+  {
+    const sb = await build([err()]);
+    out.firstFailure = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
+      observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
+      change: sb.els["#expected-change"].textContent, freshness: sb.els["#freshness"].textContent,
+      status: sb.els["#status"].textContent, busy: sb.els["#forecast"].attrs["aria-busy"] };
+  }
+  {
+    const malformed = { ...VALID, predicted_pm25: "NaN" };
+    const sb = await build([ok(VALID), ok(malformed)]);
+    const beforeLatest = sb.els["#latest-pm25"].textContent, beforeForecast = sb.els["#forecast-pm25"].textContent;
+    await sb.AirAwareDom.loadForecast();
+    await pump();
+    out.lateAtomic = { latestUnchanged: sb.els["#latest-pm25"].textContent === beforeLatest,
+      forecastUnchanged: sb.els["#forecast-pm25"].textContent === beforeForecast,
+      forecastVal: sb.els["#forecast-pm25"].textContent, freshness: sb.els["#freshness"].textContent,
+      status: sb.els["#status"].textContent, busy: sb.els["#forecast"].attrs["aria-busy"] };
+  }
+  {
+    const sb = await build([ok(VALID), ok(VALID)]);
+    const prior = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
+      observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
+      change: sb.els["#expected-change"].textContent, freshness: sb.els["#freshness"].textContent };
+    sb.AirAwareView.freshnessText = function () { throw new Error("late display formatter boom"); };
+    await sb.AirAwareDom.loadForecast();
+    await pump();
+    out.lateFormatter = { latestUnchanged: sb.els["#latest-pm25"].textContent === prior.latest,
+      forecastUnchanged: sb.els["#forecast-pm25"].textContent === prior.forecast,
+      observedUnchanged: sb.els["#observed-time"].textContent === prior.observed,
+      expectedUnchanged: sb.els["#target-window"].textContent === prior.expected,
+      changeUnchanged: sb.els["#expected-change"].textContent === prior.change,
+      latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
+      observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
+      change: sb.els["#expected-change"].textContent,
+      freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
+      busy: sb.els["#forecast"].attrs["aria-busy"] };
+  }
+  console.log(JSON.stringify(out));
+})();
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            pure_path = directory / "pure.js"
+            dom_path = directory / "dom.js"
+            harness_path = directory / "harness.js"
+            pure_path.write_text(pure, encoding="utf-8")
+            dom_path.write_text(dom, encoding="utf-8")
+            harness_path.write_text(harness, encoding="utf-8")
+            result = subprocess.run(
+                ["node", str(harness_path), str(pure_path), str(dom_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        return json.loads(result.stdout)
+
+    def test_view_model_builds_complete_valid_model(self):
+        behaviors = self.node_behaviors()
+        model = behaviors["validModel"]
+        self.assertTrue(model["ok"])
+        self.assertEqual(model["model"]["latest"], 24.0)
+        self.assertEqual(model["model"]["predicted"], 42.5)
+        self.assertEqual(model["model"]["horizonHours"], 6)
+
+    def test_view_model_valid_whole_update_renders_atomically(self):
+        behaviors = self.node_behaviors()
+        whole = behaviors["validWhole"]
+        self.assertEqual(whole["latest"], "24.0")
+        self.assertEqual(whole["forecast"], "42.5")
+        self.assertTrue(whole["observed"].startswith("Observed "))
+        self.assertTrue(whole["observed"].endswith("ICT"))
+        self.assertTrue(whole["expected"].startswith("Expected "))
+        self.assertEqual(whole["freshness"], "Updated 0 minutes ago")
+        self.assertEqual(whole["status"], "Forecast updated.")
+        self.assertEqual(whole["busy"], "false")
+
+    def test_view_model_late_malformed_field_is_atomic(self):
+        behaviors = self.node_behaviors()
+        late = behaviors["lateAtomic"]
+        self.assertTrue(late["latestUnchanged"])
+        self.assertTrue(late["forecastUnchanged"])
+        self.assertEqual(late["forecastVal"], "42.5")
+        self.assertEqual(late["freshness"], "Data may be out of date.")
+        self.assertIn("most recent forecast", late["status"])
+        formatter = behaviors["lateFormatter"]
+        self.assertTrue(formatter["latestUnchanged"])
+        self.assertTrue(formatter["forecastUnchanged"])
+        self.assertTrue(formatter["observedUnchanged"])
+        self.assertTrue(formatter["expectedUnchanged"])
+        self.assertTrue(formatter["changeUnchanged"])
+        self.assertEqual(formatter["latest"], "24.0")
+        self.assertEqual(formatter["forecast"], "42.5")
+        self.assertEqual(formatter["freshness"], "Data may be out of date.")
+        self.assertIn("most recent forecast", formatter["status"])
+        self.assertEqual(formatter["busy"], "false")
+
+    def test_view_model_rejects_bad_age_unless_stale(self):
+        behaviors = self.node_behaviors()
+        self.assertFalse(behaviors["badAgeFresh"]["ok"])
+        self.assertFalse(behaviors["badAgeNaN"]["ok"])
+        self.assertTrue(behaviors["badAgeStale"]["ok"])
+
+    def test_view_model_rejects_nonfinite_and_null_required_readings(self):
+        behaviors = self.node_behaviors()
+        self.assertFalse(behaviors["badPmNull"]["ok"])
+        self.assertFalse(behaviors["badTarget"]["ok"])
+        self.assertFalse(behaviors["badHistoryEnd"]["ok"])
+
+    def test_view_model_formats_timestamps_in_ict(self):
+        behaviors = self.node_behaviors()
+        self.assertIn("07:00", behaviors["ict"])
+        self.assertTrue(behaviors["ict"].endswith(" ICT"))
+        self.assertEqual(behaviors["ictInvalid"], "Unavailable")
+        self.assertIn("07:00", behaviors["observed"])
+        self.assertIn("13:00", behaviors["expected"])
+        self.assertTrue(behaviors["expected"].endswith("ICT"))
+        self.assertIn(" – ", behaviors["expected"])
+
+    def test_view_model_first_failure_shows_unavailable_whole_forecast(self):
+        behaviors = self.node_behaviors()
+        first = behaviors["firstFailure"]
+        self.assertEqual(first["latest"], "Unavailable")
+        self.assertEqual(first["forecast"], "Unavailable")
+        self.assertEqual(first["observed"], "Unavailable")
+        self.assertEqual(first["expected"], "Unavailable")
+        self.assertEqual(first["change"], "Forecast unavailable right now.")
+        self.assertEqual(first["freshness"], "Unavailable")
+        self.assertEqual(first["status"], "Forecast unavailable right now.")
+        self.assertEqual(first["busy"], "false")
+
+    def test_view_model_keeps_t_plus_6_semantics(self):
+        behaviors = self.node_behaviors()
+        self.assertEqual(behaviors["horizon"], 6)
+        self.assertEqual(behaviors["validModel"]["model"]["horizonHours"], 6)
+        self.assertIn("02 Feb 2025, 13:00", behaviors["expected"])
+        self.assertIn("02 Feb 2025, 14:00", behaviors["expected"])
+
+    def test_view_model_change_labels(self):
+        behaviors = self.node_behaviors()
+        self.assertIn("higher than the latest reading", behaviors["changeHigher"])
+        self.assertIn("lower than the latest reading", behaviors["changeLower"])
+        self.assertIn("No meaningful change from the latest reading", behaviors["changeNone"])
 
     def ledger_record(self):
         return ForecastRecord.create(sensor_id=13502151, prediction_time=self.prediction_time,
