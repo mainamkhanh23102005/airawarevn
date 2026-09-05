@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.forecast_ledger import SQLiteForecastStore
+from app.forecast_ledger import SQLiteForecastStore, feature_schema_sha256, sha256_file
 from scripts.modeling.features import (
     FORECAST_HORIZON_HOURS,
     V1_FEATURE_COLUMNS,
@@ -152,6 +152,26 @@ class ForecastPerformanceResponse(BaseModel):
     snapshot_id: str | None
     snapshot_created_at: datetime | None
     metrics: ForecastPerformanceMetricsResponse | None
+
+
+class ConsumerModelDetails(BaseModel):
+    model_version: str
+    evaluation_policy_version: int
+
+
+class ConsumerForecastPerformanceResponse(BaseModel):
+    available: bool
+    reason: str | None
+    range_start_utc: datetime | None
+    range_end_utc: datetime | None
+    verified_count: int | None
+    mature_issued_count: int | None
+    model_mae: float | None
+    persistence_mae: float | None
+    mae_difference: float | None
+    forecast_horizon_hours: int
+    published_at: datetime | None
+    model_details: ConsumerModelDetails | None
 
 
 REPORTING_UNAVAILABLE_DETAIL = "Forecast performance reporting is unavailable."
@@ -465,6 +485,39 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
             start_utc=snapshot.target_interval_end_start, end_utc=snapshot.target_interval_end_end,
             evaluation_policy_version=snapshot.evaluation_policy_version, snapshot_id=snapshot.snapshot_id,
             snapshot_created_at=snapshot.created_at, metrics=metrics)
+
+    @application.get("/consumer/forecast-performance", response_model=ConsumerForecastPerformanceResponse)
+    def consumer_forecast_performance(request: Request):
+        store = request.app.state.forecast_store
+        empty = dict(range_start_utc=None, range_end_utc=None, verified_count=None,
+            mature_issued_count=None, model_mae=None, persistence_mae=None,
+            mae_difference=None, forecast_horizon_hours=FORECAST_HORIZON_HOURS,
+            published_at=None, model_details=None)
+        if store is None:
+            return ConsumerForecastPerformanceResponse(available=False,
+                reason="reporting_unavailable", **empty)
+        try:
+            publication = store.current_consumer_performance(MODEL_VERSION,
+                sha256_file(configured_path), feature_schema_sha256(), TARGET_SENSOR_ID)
+        except Exception:
+            logger.exception("Consumer forecast performance lookup failed")
+            return ConsumerForecastPerformanceResponse(available=False,
+                reason="reporting_unavailable", **empty)
+        if publication is None:
+            return ConsumerForecastPerformanceResponse(available=False,
+                reason="publication_unavailable", **empty)
+        return ConsumerForecastPerformanceResponse(available=publication.available,
+            reason=publication.reason, range_start_utc=publication.range_start_utc,
+            range_end_utc=publication.range_end_utc,
+            verified_count=publication.verified_count,
+            mature_issued_count=publication.mature_issued_count,
+            model_mae=publication.model_mae,
+            persistence_mae=publication.persistence_mae,
+            mae_difference=publication.mae_difference,
+            forecast_horizon_hours=publication.forecast_horizon_hours,
+            published_at=publication.published_at,
+            model_details=ConsumerModelDetails(model_version=publication.model_version,
+                evaluation_policy_version=publication.evaluation_policy_version))
 
     @application.post("/predict", response_model=PredictionResponse)
     def predict(payload: PredictionRequest, request: Request):

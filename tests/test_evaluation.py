@@ -59,7 +59,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
             before = connection.execute("SELECT * FROM forecasts").fetchone()
         store.initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertEqual(connection.execute("SELECT * FROM forecasts").fetchone(), before)
         failed = Path(self.directory.name) / "failed.sqlite3"
         failed_store = SQLiteForecastStore(failed)
@@ -74,6 +74,48 @@ class EvaluationPersistenceTests(unittest.TestCase):
         with sqlite3.connect(failed) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_rows'").fetchone())
+
+    def _capture_rows(self, store, names):
+        with sqlite3.connect(store.path) as connection:
+            return {name: [tuple(row) for row in connection.execute(f"SELECT * FROM {name} ORDER BY rowid").fetchall()] for name in names}
+
+    def test_v8_migration_preserves_rows_and_recreates_consumer_publications(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        store.insert(self.forecast)
+        start = self.forecast.target_interval_start
+        batch = AcquisitionBatch.create(sensor_id=9, requested_interval_start=start,
+            requested_interval_end=start + timedelta(hours=1), retrieved_at=start + timedelta(hours=3),
+            source_endpoint="/sensors/9/hours", http_status=200, raw_payload_sha256="c" * 64,
+            normalized_payload_sha256="f" * 64, created_at=start + timedelta(hours=3), records=[{
+                "sensor_id": 9, "event_time": start, "period_end_utc": start + timedelta(hours=1),
+                "value_decimal": Decimal("12.5"), "unit": "µg/m³", "record_id": 1}])
+        self.assertEqual(GroundTruthReconciler(store, now=lambda: start + timedelta(hours=3)).reconcile(self.forecast, batch).status, "reconciled")
+        revision = replace(batch, acquisition_id=None, retrieved_at=batch.retrieved_at + timedelta(hours=1),
+            raw_payload_sha256="d" * 64, records=tuple({**row, "value_decimal": Decimal("13.5")} for row in batch.records))
+        revision = AcquisitionBatch.create(**revision.__dict__)
+        self.assertEqual(GroundTruthReconciler(store, now=lambda: start + timedelta(hours=5)).reconcile(self.forecast, revision).status, "revision_detected")
+        self.assertEqual(store.materialize_evaluation(self.forecast.forecast_id).status, "inserted")
+        window_end = self.forecast.target_interval_end + timedelta(hours=1)
+        self.assertEqual(store.create_evaluation_run_snapshot(self.forecast.model_version,
+            self.forecast.model_artifact_sha256, self.forecast.feature_schema_sha256,
+            self.forecast.sensor_id, start, window_end, start + timedelta(hours=5)).status, "inserted")
+        tables = ("forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions",
+            "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors")
+        before = self._capture_rows(store, tables)
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("DROP TABLE consumer_performance_publications")
+            connection.execute("PRAGMA user_version=7")
+        store.initialize()
+        with sqlite3.connect(store.path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='consumer_performance_current_idx'").fetchone())
+            foreign = {(row[3], row[2], row[4]) for row in connection.execute("PRAGMA foreign_key_list(consumer_performance_publications)")}
+            self.assertEqual(foreign, {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")})
+        self.assertEqual(self._capture_rows(store, tables), before)
+        store.initialize()
+        self.assertEqual(self._capture_rows(store, tables), before)
 
     def test_m3_schema_rejects_nullable_or_nonunique_evaluation_relationships(self):
         changes = (
@@ -153,7 +195,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
     def test_fresh_schema_and_materialization_are_immutable_and_idempotent(self):
         store = self._settled_store()
         with store._connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_rows'").fetchone())
         first = store.materialize_evaluation(self.forecast.forecast_id)
         self.assertEqual((first.status, first.record.observed_pm25, first.record.model_error, first.record.persistence_error),

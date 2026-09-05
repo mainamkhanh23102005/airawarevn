@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.evaluation_monitor import materialize_available_evaluations
-from app.forecast_ledger import SQLiteForecastStore, issue_forecast
+from app.forecast_ledger import (SQLiteForecastStore, feature_schema_sha256,
+                                 issue_forecast, sha256_file)
+from app.main import MODEL_VERSION
+from scripts.modeling.features import FORECAST_HORIZON_HOURS
+from scripts.openmeteo import TARGET_SENSOR_ID
 from scripts.reconcile_ground_truth import run_reconciliation
 
 
@@ -18,7 +22,18 @@ def run_monitoring_cycle(database, raw_directory, api_key, model_path=DEFAULT_MO
     reconciliation = run_reconciliation(database, raw_directory, api_key, now=now)
     store = SQLiteForecastStore(database)
     store.initialize()
-    evaluation = materialize_available_evaluations(store)
+    reference = now().astimezone(timezone.utc)
+    if Path(model_path).is_file():
+        evaluation = materialize_available_evaluations(store, consumer_cohort={
+            "model_version": MODEL_VERSION,
+            "model_artifact_sha256": sha256_file(model_path),
+            "feature_schema_sha256": feature_schema_sha256(),
+            "sensor_id": TARGET_SENSOR_ID,
+            "evaluation_policy_version": 1,
+            "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
+        }, now=reference)
+    else:
+        evaluation = materialize_available_evaluations(store)
     return issue, reconciliation, evaluation
 
 

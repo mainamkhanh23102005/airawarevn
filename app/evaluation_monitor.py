@@ -1,6 +1,8 @@
 import sqlite3
 from dataclasses import dataclass
 from datetime import timedelta
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 from app.forecast_ledger import ForecastIntegrityError
 
@@ -10,6 +12,7 @@ class EvaluationMonitoringResult:
     results: tuple
     counts: dict
     snapshot_results: tuple = ()
+    consumer_publication: object | None = None
 
 
 def _snapshot_evaluation(store, record):
@@ -19,7 +22,7 @@ def _snapshot_evaluation(store, record):
         record.target_interval_end + timedelta(hours=1), record.evaluated_at)
 
 
-def materialize_available_evaluations(store, limit=None):
+def materialize_available_evaluations(store, limit=None, consumer_cohort=None, now=None):
     results = []
     snapshot_results = []
     for forecast_id in store.pending_evaluation_forecast_ids(limit):
@@ -53,4 +56,16 @@ def materialize_available_evaluations(store, limit=None):
     counts = {}
     for _, status, _ in results:
         counts[status] = counts.get(status, 0) + 1
-    return EvaluationMonitoringResult(tuple(results), counts, tuple(snapshot_results))
+    publication = None
+    if consumer_cohort is not None:
+        reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        ict = ZoneInfo("Asia/Ho_Chi_Minh")
+        local = reference.astimezone(ict)
+        if local.timetz().replace(tzinfo=None) >= time(3, 15):
+            publication = store.publish_consumer_performance(
+                consumer_cohort["model_version"], consumer_cohort["model_artifact_sha256"],
+                consumer_cohort["feature_schema_sha256"], consumer_cohort["sensor_id"],
+                reference, reference,
+                consumer_cohort.get("evaluation_policy_version", 1),
+                consumer_cohort.get("forecast_horizon_hours", 6))
+    return EvaluationMonitoringResult(tuple(results), counts, tuple(snapshot_results), publication)
