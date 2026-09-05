@@ -18,6 +18,9 @@
     .note { margin: .5rem 0 0; color: #4b6155; }
     .change { margin: .5rem 0 0; font-size: 1.05rem; }
     .full { grid-column: 1 / -1; }
+    #accuracy { color: #4b6155; }
+    #accuracy h2 { color: #4b6155; }
+    #accuracy p { margin: .5rem 0 0; }
     #status { min-height: 1.5rem; margin: 1.5rem 0 0; }
     button { margin-top: 1.5rem; border: 0; background: #176b45; color: white; padding: .75rem 1rem; font: inherit; font-weight: 700; cursor: pointer; }
     button:focus-visible { outline: 3px solid #17211c; outline-offset: 3px; }
@@ -53,6 +56,14 @@
       <section class="full" aria-labelledby="freshness-title">
         <h2 id="freshness-title">Data freshness</h2>
         <p id="freshness" class="note">Unavailable.</p>
+      </section>
+
+      <section id="accuracy" class="full" aria-labelledby="accuracy-title" aria-busy="true">
+        <h2 id="accuracy-title">Forecast accuracy</h2>
+        <p id="accuracy-summary" role="status" aria-live="polite">Loading forecast accuracy…</p>
+        <p id="accuracy-explanation"></p>
+        <p id="accuracy-comparison"></p>
+        <p id="accuracy-evidence"></p>
       </section>
     </div>
 
@@ -156,6 +167,60 @@
         return "Updated " + Math.max(0, Math.round(model.age)) + " minutes ago";
       }
 
+      function formatIctDate(value) {
+        var date = new Date(value);
+        if (Number.isNaN(date.getTime())) return null;
+        return new Intl.DateTimeFormat("en-US", {
+          timeZone: ICT_TIME_ZONE,
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        }).format(date);
+      }
+
+      function evidenceDates(start, end) {
+        var endDate = new Date(end);
+        if (Number.isNaN(endDate.getTime())) return null;
+        endDate.setTime(endDate.getTime() - 1);
+        var startText = formatIctDate(start);
+        var endText = formatIctDate(endDate);
+        return startText && endText ? startText + " – " + endText : null;
+      }
+
+      function buildPerformanceModel(data) {
+        var source = data && typeof data === "object" ? data : {};
+        if (source.available === false) {
+          if (source.reason === "insufficient_history") return { state: "insufficient_history" };
+          if (source.reason === "publication_unavailable") return { state: "publication_unavailable" };
+          return { state: "reporting_unavailable" };
+        }
+        if (source.available !== true) return { state: "reporting_unavailable" };
+        var modelMae = finiteValue(source.model_mae);
+        var persistenceMae = finiteValue(source.persistence_mae);
+        var difference = finiteValue(source.mae_difference);
+        var count = finiteValue(source.verified_count);
+        var start = timestamp(source.range_start_utc);
+        var end = timestamp(source.range_end_utc);
+        var dates = evidenceDates(source.range_start_utc, source.range_end_utc);
+        if (!Number.isFinite(modelMae) || !Number.isFinite(persistenceMae) ||
+            !Number.isFinite(difference) || !Number.isInteger(count) || count < 1 ||
+            Number.isNaN(start) || Number.isNaN(end) || end <= start || !dates) {
+          return { state: "reporting_unavailable" };
+        }
+        return { state: "available", modelMae: modelMae, difference: difference, count: count, dates: dates };
+      }
+
+      function performanceComparison(difference) {
+        var rounded = Math.abs(difference).toFixed(1);
+        if (parseFloat(rounded) === 0) {
+          return "AirAware and using the latest reading alone had about the same average error.";
+        }
+        if (difference > 0) {
+          return "Compared with using the latest reading alone, AirAware had " + rounded + " µg/m³ lower average error.";
+        }
+        return "Compared with using the latest reading alone, AirAware had " + rounded + " µg/m³ higher average error.";
+      }
+
       root.AirAwareView = {
         formatIct: formatIct,
         buildModel: buildModel,
@@ -163,6 +228,10 @@
         observedText: observedText,
         expectedText: expectedText,
         freshnessText: freshnessText,
+        formatIctDate: formatIctDate,
+        evidenceDates: evidenceDates,
+        buildPerformanceModel: buildPerformanceModel,
+        performanceComparison: performanceComparison,
         ICT_TIME_ZONE: ICT_TIME_ZONE,
         HORIZON_HOURS: 6,
       };
@@ -181,8 +250,14 @@
       var targetEl = document.querySelector("#target-window");
       var changeEl = document.querySelector("#expected-change");
       var freshnessEl = document.querySelector("#freshness");
+      var accuracyEl = document.querySelector("#accuracy");
+      var accuracySummaryEl = document.querySelector("#accuracy-summary");
+      var accuracyExplanationEl = document.querySelector("#accuracy-explanation");
+      var accuracyComparisonEl = document.querySelector("#accuracy-comparison");
+      var accuracyEvidenceEl = document.querySelector("#accuracy-evidence");
 
       var state = "loading";
+
       var hasValidPrior = false;
 
       function setBusy(busy) {
@@ -234,6 +309,44 @@
         setBusy(false);
       }
 
+      function applyPerformance(model) {
+        accuracyEl.setAttribute("aria-busy", "false");
+        accuracyExplanationEl.textContent = "";
+        accuracyComparisonEl.textContent = "";
+        accuracyEvidenceEl.textContent = "";
+        if (model.state === "available") {
+          accuracySummaryEl.textContent = "Over the last 30 days, forecasts differed from verified PM2.5 readings by an average of " + model.modelMae.toFixed(1) + " µg/m³.";
+          accuracyExplanationEl.textContent = "This is the mean absolute error (MAE): lower values mean forecasts were closer to the verified readings.";
+          accuracyComparisonEl.textContent = view.performanceComparison(model.difference);
+          accuracyEvidenceEl.textContent = "Based on " + model.count + " verified forecasts, " + model.dates + ".";
+          return;
+        }
+        if (model.state === "insufficient_history") {
+          accuracySummaryEl.textContent = "Accuracy results are not ready yet. AirAware needs more verified forecasts before showing this summary.";
+          return;
+        }
+        if (model.state === "publication_unavailable") {
+          accuracySummaryEl.textContent = "Forecast accuracy summary is not available yet.";
+          return;
+        }
+        accuracySummaryEl.textContent = "Forecast accuracy is unavailable right now.";
+      }
+
+      async function loadPerformance() {
+        accuracyEl.setAttribute("aria-busy", "true");
+        accuracySummaryEl.textContent = "Loading forecast accuracy…";
+        accuracyExplanationEl.textContent = "";
+        accuracyComparisonEl.textContent = "";
+        accuracyEvidenceEl.textContent = "";
+        try {
+          var response = await fetch("/consumer/forecast-performance");
+          if (!response.ok) throw new Error("Forecast accuracy is unavailable right now.");
+          applyPerformance(view.buildPerformanceModel(await response.json()));
+        } catch (error) {
+          applyPerformance({ state: "reporting_unavailable" });
+        }
+      }
+
       async function loadForecast() {
         showLoading();
         try {
@@ -250,8 +363,9 @@
       }
 
       refreshEl.addEventListener("click", loadForecast);
-      window.AirAwareDom = { loadForecast: loadForecast };
+      window.AirAwareDom = { loadForecast: loadForecast, loadPerformance: loadPerformance };
       loadForecast();
+      loadPerformance();
     })();
   </script>
 </body>
