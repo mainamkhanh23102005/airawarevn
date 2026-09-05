@@ -621,6 +621,21 @@ class ApiTests(unittest.TestCase):
         self.assertIn("aria-busy", response.text)
         self.assertIn("<h2", response.text)
 
+    def test_webpage_forecast_accuracy_section_is_secondary_and_accessible(self):
+        with self.client() as client:
+            html = client.get("/").text
+
+        self.assertIn('id="accuracy"', html)
+        self.assertIn("Forecast accuracy", html)
+        self.assertLess(html.index("Data freshness"), html.index("Forecast accuracy"))
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn('aria-busy="true"', html)
+        self.assertIn("Loading forecast accuracy…", html)
+        self.assertIn('"/consumer/forecast-performance"', html)
+        for internal in ("mature_issued_count", "published_at", "model_details", "model_version",
+                         "evaluation_policy_version", "sensor_id", "snapshot_id", "membership_sha256"):
+            self.assertNotIn(internal, html)
+
     def webpage_scripts(self):
         html = self.client().get("/").text
         blocks = re.findall(r"<script>(.*?)</script>", html, re.S)
@@ -645,12 +660,20 @@ function makeEl() { return { textContent: "", attrs: {}, setAttribute(k, v) { th
 function ok(p) { return { ok: true, status: 200, json: async () => p }; }
 function err() { return { ok: false, status: 503, json: async () => ({ detail: "Forecast source is unavailable." }) }; }
 function pump() { return new Promise(r => setTimeout(r, 0)); }
-async function build(queue) {
-  const sb = { console };
-  sb.window = sb;
-  const els = {};
-  sb.document = { querySelector(s) { return els[s] || (els[s] = makeEl()); } };
-  sb.fetch = async () => (queue.length ? queue.shift() : err());
+async function build(forecasts, performances) {
+   forecasts = forecasts || [];
+   performances = performances || [];
+   const sb = { console };
+   sb.window = sb;
+   const els = {};
+   sb.document = { querySelector(s) { return els[s] || (els[s] = makeEl()); } };
+   sb.urls = [];
+   sb.fetch = async url => {
+     sb.urls.push(url);
+     const queue = url === "/consumer/forecast-performance" ? performances : forecasts;
+     return queue.length ? queue.shift() : err();
+   };
+
   vm.createContext(sb);
   vm.runInContext(pure, sb);
   vm.runInContext(dom, sb);
@@ -659,10 +682,15 @@ async function build(queue) {
   return sb;
 }
 const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: "2025-02-02T06:00:00Z",
-  target_interval_end: "2025-02-02T07:00:00Z", forecast_horizon_hours: 6, predicted_pm25: 42.5,
-  unit: "µg/m³", model_version: "v1", latest_completed_pm25: 24.0, history_start: "2025-02-01T00:00:00Z",
-  history_end: "2025-02-02T00:00:00Z", data_mode: "fresh_openaq", source_retrieved_at: "2025-02-02T00:00:00Z",
-  sensor_id: 13502151, freshness_status: "fresh", age_minutes: 0 };
+   target_interval_end: "2025-02-02T07:00:00Z", forecast_horizon_hours: 6, predicted_pm25: 42.5,
+   unit: "µg/m³", model_version: "v1", latest_completed_pm25: 24.0, history_start: "2025-02-01T00:00:00Z",
+   history_end: "2025-02-02T00:00:00Z", data_mode: "fresh_openaq", source_retrieved_at: "2025-02-02T00:00:00Z",
+   sensor_id: 13502151, freshness_status: "fresh", age_minutes: 0 };
+const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-05T17:00:00Z",
+   range_end_utc: "2026-01-04T17:00:00Z", verified_count: 48, mature_issued_count: 48,
+   model_mae: 3.2, persistence_mae: 4.6, mae_difference: 1.4, forecast_horizon_hours: 6,
+   published_at: "2026-01-05T00:00:00Z", model_details: { model_version: "v1", evaluation_policy_version: 1 } };
+
 (async () => {
   const out = {};
   const pureSb = { console };
@@ -686,14 +714,14 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
   out.changeLower = V.changeText({ latest: 15, predicted: 10 });
   out.changeNone = V.changeText({ latest: 10, predicted: 10 });
   {
-    const sb = await build([ok(VALID)]);
+    const sb = await build([ok(VALID)], [err()]);
     out.validWhole = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
       observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
       freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
       busy: sb.els["#forecast"].attrs["aria-busy"] };
   }
   {
-    const sb = await build([err()]);
+    const sb = await build([err()], [err()]);
     out.firstFailure = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
       observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
       change: sb.els["#expected-change"].textContent, freshness: sb.els["#freshness"].textContent,
@@ -701,7 +729,7 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
   }
   {
     const malformed = { ...VALID, predicted_pm25: "NaN" };
-    const sb = await build([ok(VALID), ok(malformed)]);
+    const sb = await build([ok(VALID), ok(malformed)], [err()]);
     const beforeLatest = sb.els["#latest-pm25"].textContent, beforeForecast = sb.els["#forecast-pm25"].textContent;
     await sb.AirAwareDom.loadForecast();
     await pump();
@@ -711,7 +739,7 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
       status: sb.els["#status"].textContent, busy: sb.els["#forecast"].attrs["aria-busy"] };
   }
   {
-    const sb = await build([ok(VALID), ok(VALID)]);
+    const sb = await build([ok(VALID), ok(VALID)], [err()]);
     const prior = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
       observed: sb.els["#observed-time"].textContent, expected: sb.els["#target-window"].textContent,
       change: sb.els["#expected-change"].textContent, freshness: sb.els["#freshness"].textContent };
@@ -728,6 +756,32 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
       change: sb.els["#expected-change"].textContent,
       freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
       busy: sb.els["#forecast"].attrs["aria-busy"] };
+  }
+  {
+    const sb = await build([ok(VALID)], [ok(PERFORMANCE)]);
+    out.performanceAvailable = { summary: sb.els["#accuracy-summary"].textContent,
+      explanation: sb.els["#accuracy-explanation"].textContent,
+      comparison: sb.els["#accuracy-comparison"].textContent,
+      evidence: sb.els["#accuracy-evidence"].textContent,
+      busy: sb.els["#accuracy"].attrs["aria-busy"], forecast: sb.els["#forecast-pm25"].textContent,
+      urls: sb.urls };
+  }
+  for (const reason of ["insufficient_history", "publication_unavailable", "reporting_unavailable"]) {
+    const sb = await build([ok(VALID)], [ok({ available: false, reason })]);
+    out[reason] = { summary: sb.els["#accuracy-summary"].textContent,
+      explanation: sb.els["#accuracy-explanation"].textContent, busy: sb.els["#accuracy"].attrs["aria-busy"] };
+  }
+  {
+    const zero = await build([ok(VALID)], [ok({ ...PERFORMANCE, mae_difference: 0 })]);
+    const negative = await build([ok(VALID)], [ok({ ...PERFORMANCE, mae_difference: -1.4 })]);
+    const failed = await build([ok(VALID)], [err()]);
+    const malformed = await build([ok(VALID)], [ok({ ...PERFORMANCE, model_mae: "NaN", model_details: { model_version: "private", evaluation_policy_version: 99 } })]);
+    out.performanceComparisons = { zero: zero.els["#accuracy-comparison"].textContent,
+      negative: negative.els["#accuracy-comparison"].textContent };
+    out.performanceFailures = { network: failed.els["#accuracy-summary"].textContent,
+      malformed: malformed.els["#accuracy-summary"].textContent,
+      malformedContent: malformed.els["#accuracy-explanation"].textContent + malformed.els["#accuracy-comparison"].textContent + malformed.els["#accuracy-evidence"].textContent,
+      forecastUnaffected: failed.els["#forecast-pm25"].textContent };
   }
   console.log(JSON.stringify(out));
 })();
@@ -747,6 +801,38 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
                 check=True,
             )
         return json.loads(result.stdout)
+
+    def test_performance_view_model_renders_consumer_safe_available_summary(self):
+        performance = self.node_behaviors()["performanceAvailable"]
+        self.assertEqual(performance["busy"], "false")
+        self.assertEqual(performance["forecast"], "42.5")
+        self.assertEqual(performance["urls"], ["/forecast/current", "/consumer/forecast-performance"])
+        self.assertEqual(performance["summary"], "Over the last 30 days, forecasts differed from verified PM2.5 readings by an average of 3.2 µg/m³.")
+        self.assertEqual(performance["explanation"], "This is the mean absolute error (MAE): lower values mean forecasts were closer to the verified readings.")
+        self.assertEqual(performance["comparison"], "Compared with using the latest reading alone, AirAware had 1.4 µg/m³ lower average error.")
+        self.assertEqual(performance["evidence"], "Based on 48 verified forecasts, Dec 6, 2025 – Jan 4, 2026.")
+
+    def test_performance_view_model_handles_comparison_direction_without_overclaiming(self):
+        comparisons = self.node_behaviors()["performanceComparisons"]
+        self.assertEqual(comparisons["zero"], "AirAware and using the latest reading alone had about the same average error.")
+        self.assertEqual(comparisons["negative"], "Compared with using the latest reading alone, AirAware had 1.4 µg/m³ higher average error.")
+        self.assertNotIn("improvement", comparisons["negative"].lower())
+
+    def test_performance_view_model_handles_all_unavailable_states(self):
+        behaviors = self.node_behaviors()
+        self.assertEqual(behaviors["insufficient_history"]["summary"], "Accuracy results are not ready yet. AirAware needs more verified forecasts before showing this summary.")
+        self.assertEqual(behaviors["publication_unavailable"]["summary"], "Forecast accuracy summary is not available yet.")
+        self.assertEqual(behaviors["reporting_unavailable"]["summary"], "Forecast accuracy is unavailable right now.")
+        for state in ("insufficient_history", "publication_unavailable", "reporting_unavailable"):
+            self.assertEqual(behaviors[state]["explanation"], "")
+            self.assertEqual(behaviors[state]["busy"], "false")
+
+    def test_performance_view_model_rejects_network_and_malformed_responses(self):
+        failures = self.node_behaviors()["performanceFailures"]
+        self.assertEqual(failures["network"], "Forecast accuracy is unavailable right now.")
+        self.assertEqual(failures["malformed"], "Forecast accuracy is unavailable right now.")
+        self.assertEqual(failures["malformedContent"], "")
+        self.assertEqual(failures["forecastUnaffected"], "42.5")
 
     def test_view_model_builds_complete_valid_model(self):
         behaviors = self.node_behaviors()
