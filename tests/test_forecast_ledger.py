@@ -8,9 +8,11 @@ import unittest
 import unicodedata
 import uuid
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -25,6 +27,7 @@ from app.forecast_ledger import (
     issue_forecast,
     sha256_file,
 )
+from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 from scripts.modeling.features import V1_FEATURE_COLUMNS
 from scripts.modeling.train import save_artifact, train_v1_model
 from scripts.modeling.features import build_v1_features
@@ -58,6 +61,54 @@ class ForecastLedgerTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def _forecast(self, prediction_time):
+        return ForecastRecord.create(
+            sensor_id=13502151,
+            prediction_time=prediction_time,
+            predicted_pm25=12.0,
+            persistence_prediction=14.0,
+            model_version="v1",
+            model_artifact_sha256="a" * 64,
+            feature_schema_sha256="b" * 64,
+            artifact_version=1,
+            feature_configuration="A2",
+            source_retrieved_at=prediction_time,
+            input_data_cutoff=prediction_time,
+            history_start=prediction_time - timedelta(hours=24),
+            history_end=prediction_time - timedelta(hours=1),
+            data_mode_at_issue="fresh_openaq",
+            freshness_status_at_issue="fresh",
+            source_age_minutes_at_issue=0,
+            issued_at=prediction_time + timedelta(minutes=1),
+        )
+
+    def _insert_forecast(self, store, target_interval_end):
+        forecast = self._forecast(target_interval_end - timedelta(hours=7))
+        store.insert(forecast)
+        return forecast
+
+    def _evaluate_at(self, store, target_interval_end):
+        forecast = self._insert_forecast(store, target_interval_end)
+        batch = AcquisitionBatch.create(sensor_id=forecast.sensor_id,
+            requested_interval_start=forecast.target_interval_start,
+            requested_interval_end=forecast.target_interval_end,
+            retrieved_at=forecast.target_interval_end + timedelta(hours=2),
+            source_endpoint="/sensors/13502151/hours", http_status=200,
+            raw_payload_sha256=(str(forecast.sensor_id) * 64)[:64],
+            normalized_payload_sha256="f" * 64, created_at=forecast.target_interval_end + timedelta(hours=2),
+            records=[{"sensor_id": forecast.sensor_id, "event_time": forecast.target_interval_start,
+                "period_end_utc": forecast.target_interval_end, "value_decimal": Decimal("10"),
+                "unit": "µg/m³", "record_id": forecast.sensor_id}])
+        GroundTruthReconciler(store, now=lambda: forecast.target_interval_end + timedelta(hours=2)).reconcile(forecast, batch)
+        return store.materialize_evaluation(forecast.forecast_id).record
+
+    def _publication_window(self, reference):
+        ict = ZoneInfo("Asia/Ho_Chi_Minh")
+        publication_date = reference.astimezone(ict).date()
+        end = datetime.combine(publication_date, time.min, ict).astimezone(timezone.utc)
+        return publication_date, end - timedelta(days=30), end
+
 
     def test_canonical_identity_and_uuid_are_exact_and_unicode_normalized(self):
         record = ForecastRecord.create(**{**self.record.as_dict(), "forecast_id": None, "model_version": "v\u0069\u0301"})
@@ -125,7 +176,7 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertEqual(result.status, "inserted")
         self.assertEqual(SQLiteForecastStore(self.database).latest(), self.record)
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_identical_insert_is_idempotent_but_conflict_never_overwrites(self):
         store = SQLiteForecastStore(self.database)
@@ -302,6 +353,189 @@ class ForecastLedgerTests(unittest.TestCase):
         store = SQLiteForecastStore(bad_database)
         store.initialize()
         self.assertEqual(store.count(), 0)
+
+    def test_consumer_publication_empty_history_is_idempotent(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2025, 2, 2, 20, 15, tzinfo=timezone.utc)
+        first = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
+        second = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference + timedelta(minutes=1))
+        self.assertEqual(first, second)
+        self.assertEqual((first.available, first.reason, first.verified_count,
+                          first.mature_issued_count), (False, "insufficient_history", 0, 0))
+        self.assertIsNone(first.snapshot_id)
+
+    def test_consumer_publication_selects_and_persists_in_one_connection(self):
+        class ConnectionCountingStore(SQLiteForecastStore):
+            connection_count = 0
+
+            def _connect(inner_self):
+                inner_self.connection_count += 1
+                return super(ConnectionCountingStore, inner_self)._connect()
+
+        store = ConnectionCountingStore(self.database)
+        store.initialize()
+        store.connection_count = 0
+        reference = datetime(2025, 2, 2, 20, 15, tzinfo=timezone.utc)
+        store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
+        self.assertEqual(store.connection_count, 1)
+
+    def test_publication_window_includes_exact_start_and_excludes_exact_end(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        publication_date, start, end = self._publication_window(reference)
+        self._evaluate_at(store, start)
+        self._evaluate_at(store, end)
+        publication = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
+        self.assertEqual(publication.publication_date, publication_date.isoformat())
+        self.assertEqual(publication.verified_count, 1)
+        self.assertEqual(publication.mature_issued_count, 1)
+        self.assertIsNotNone(publication.snapshot_id)
+
+    def test_publication_window_excludes_boundaries_just_outside_start_and_end(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        _, start, end = self._publication_window(reference)
+        self._evaluate_at(store, start - timedelta(hours=1))
+        self._evaluate_at(store, end + timedelta(hours=1))
+        publication = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
+        self.assertEqual(publication.verified_count, 0)
+        self.assertEqual(publication.mature_issued_count, 0)
+
+    def test_publication_mature_denominator_cuts_off_at_reference_minus_120_minutes(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 9, 17, 0, tzinfo=timezone.utc)
+        cutoff = reference - timedelta(minutes=120)
+        _, start, _ = self._publication_window(reference)
+        self._insert_forecast(store, cutoff - timedelta(hours=1))
+        self._insert_forecast(store, cutoff)
+        self._insert_forecast(store, cutoff + timedelta(hours=1))
+        self._insert_forecast(store, start - timedelta(hours=1))
+        publication = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
+        self.assertEqual(publication.mature_issued_count, 2)
+        self.assertEqual(publication.verified_count, 0)
+
+
+    def _populate_verified(self, store, count, reference):
+        _, start, _ = self._publication_window(reference)
+        for index in range(count):
+            self._evaluate_at(store, start + timedelta(hours=index))
+        return start
+
+    def test_consumer_publication_47_vs_48_verified_threshold(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        start = self._populate_verified(store, 47, reference)
+        below = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        self.assertEqual(below.verified_count, 47)
+        self.assertFalse(below.available)
+        self.assertEqual(below.reason, "insufficient_history")
+        self.assertIsNone(below.model_mae)
+        self.assertIsNone(below.persistence_mae)
+        self.assertIsNone(below.mae_difference)
+        self.assertIsNotNone(below.snapshot_id)
+        self._evaluate_at(store, start + timedelta(hours=47))
+        above = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        self.assertEqual(above.verified_count, 48)
+        self.assertTrue(above.available)
+        self.assertIsNone(above.reason)
+        self.assertAlmostEqual(above.model_mae, 2.0)
+        self.assertAlmostEqual(above.persistence_mae, 4.0)
+        self.assertAlmostEqual(above.mae_difference, 2.0)
+        self.assertIsNotNone(above.snapshot_id)
+
+    def test_consumer_publication_rejects_verified_exceeding_mature(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 9, 17, 30, tzinfo=timezone.utc)
+        _, start, end = self._publication_window(reference)
+        cutoff = reference - timedelta(minutes=120)
+        self.assertGreater(cutoff, start)
+        self.assertLess(cutoff, end)
+        self._evaluate_at(store, cutoff - timedelta(minutes=30))
+        self._evaluate_at(store, cutoff + timedelta(minutes=30))
+        with self.assertRaises(ForecastIntegrityError):
+            store.publish_consumer_performance(
+                "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
+
+    def test_consumer_publication_identical_repeat_same_id_no_duplicate(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        self._populate_verified(store, 48, reference)
+        first = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        second = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference + timedelta(minutes=1), minimum_verified_count=48)
+        self.assertEqual(first, second)
+        self.assertEqual(first.publication_id, second.publication_id)
+        with sqlite3.connect(self.database) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM consumer_performance_publications WHERE publication_id=?",
+                (first.publication_id,)).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_consumer_publication_changed_membership_new_id_old_row_immutable(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        start = self._populate_verified(store, 48, reference)
+        earlier = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        self._evaluate_at(store, start + timedelta(hours=48))
+        later = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        self.assertEqual(later.verified_count, 49)
+        self.assertNotEqual(earlier.membership_sha256, later.membership_sha256)
+        self.assertNotEqual(earlier.publication_id, later.publication_id)
+        with sqlite3.connect(self.database) as connection:
+            rows = {row[0] for row in connection.execute("SELECT publication_id FROM consumer_performance_publications")}
+            stored = connection.execute("SELECT verified_count, membership_sha256 FROM consumer_performance_publications WHERE publication_id=?",
+                (earlier.publication_id,)).fetchone()
+        self.assertEqual(len(rows), 2)
+        self.assertIn(earlier.publication_id, rows)
+        self.assertIn(later.publication_id, rows)
+        self.assertEqual(tuple(stored), (48, earlier.membership_sha256))
+
+    def test_current_consumer_performance_ordering_deterministic(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        start = self._populate_verified(store, 48, reference)
+        store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        self._evaluate_at(store, start + timedelta(hours=48))
+        latest = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        current = store.current_consumer_performance("v1", "a" * 64, "b" * 64, 13502151)
+        self.assertEqual(current.publication_id, latest.publication_id)
+        self.assertEqual(current.verified_count, 49)
+        self.assertEqual(current, store.current_consumer_performance("v1", "a" * 64, "b" * 64, 13502151))
+
+    def test_consumer_publication_metrics_match_selected_cohort(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        _, start, end = self._publication_window(reference)
+        self._populate_verified(store, 48, reference)
+        publication = store.publish_consumer_performance(
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+        metrics = store.evaluation_metrics("v1", "a" * 64, "b" * 64, 13502151, start, end)
+        self.assertEqual(metrics.count, publication.verified_count)
+        self.assertEqual(metrics.model_mae, publication.model_mae)
+        self.assertEqual(metrics.persistence_mae, publication.persistence_mae)
+        self.assertEqual(metrics.mae_improvement, publication.mae_difference)
 
 
 if __name__ == "__main__":

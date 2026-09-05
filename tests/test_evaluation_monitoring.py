@@ -1,14 +1,17 @@
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+from app.evaluation_monitor import materialize_available_evaluations
 from app.forecast_ledger import ForecastRecord, SQLiteForecastStore
 from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 
 
 UTC = timezone.utc
+ICT = ZoneInfo("Asia/Ho_Chi_Minh")
 ARTIFACT = "a" * 64
 SCHEMA = "b" * 64
 
@@ -22,6 +25,11 @@ class EvaluationMonitoringTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def _cohort(self, model_version="v1", sensor_id=9):
+        return {"model_version": model_version, "model_artifact_sha256": ARTIFACT,
+                "feature_schema_sha256": SCHEMA, "sensor_id": sensor_id,
+                "evaluation_policy_version": 1, "forecast_horizon_hours": 6}
 
     def _evaluate(self, prediction_time, predicted, persistence, observed, model_version="v1", artifact=ARTIFACT, schema=SCHEMA, sensor_id=9):
         forecast = ForecastRecord.create(sensor_id=sensor_id, prediction_time=prediction_time,
@@ -216,6 +224,29 @@ class EvaluationMonitoringTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "invalid durable snapshot"):
             self.store.find_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end,
                 row.target_interval_end + timedelta(hours=1))
+
+    def test_materialize_gate_suppresses_publication_before_0315(self):
+        result = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(),
+            now=datetime(2026, 1, 2, 3, 14, 59, tzinfo=ICT))
+        self.assertIsNone(result.consumer_publication)
+
+    def test_materialize_gate_publishes_at_exact_0315(self):
+        result = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(),
+            now=datetime(2026, 1, 2, 3, 15, 0, tzinfo=ICT))
+        self.assertIsNotNone(result.consumer_publication)
+
+    def test_materialize_gate_publishes_after_0315(self):
+        result = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(),
+            now=datetime(2026, 1, 2, 3, 15, 1, tzinfo=ICT))
+        self.assertIsNotNone(result.consumer_publication)
+
+    def test_materialize_publication_date_uses_ict_date_not_utc_date(self):
+        result = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(),
+            now=datetime(2026, 1, 1, 20, 30, 0, tzinfo=UTC))
+        publication = result.consumer_publication
+        self.assertIsNotNone(publication)
+        self.assertEqual(publication.publication_date, "2026-01-02")
+        self.assertNotEqual(publication.publication_date, "2026-01-01")
 
 
 if __name__ == "__main__":

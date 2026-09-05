@@ -8,10 +8,11 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import joblib
 import pandas as pd
@@ -20,7 +21,12 @@ from fastapi.testclient import TestClient
 from app import main
 from app.evaluation_monitor import materialize_available_evaluations
 from app.main import create_app
-from app.forecast_ledger import ForecastRecord, SQLiteForecastStore
+from app.forecast_ledger import (
+    ForecastRecord,
+    SQLiteForecastStore,
+    feature_schema_sha256,
+    sha256_file,
+)
 from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 from scripts.modeling.features import V1_FEATURE_COLUMNS, build_v1_features
 from scripts.modeling.predict import predict_pm25_t_plus_6
@@ -1115,6 +1121,152 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
                 response = client.get("/reporting/forecast-performance", params=params)
         self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast performance reporting is unavailable."}))
         self.assertNotIn(str(database), response.text)
+
+    def _consumer_evaluate(self, store, target_interval_end):
+        artifact_sha = sha256_file(self.artifact_path)
+        schema_sha = feature_schema_sha256()
+        forecast = ForecastRecord.create(sensor_id=13502151,
+            prediction_time=target_interval_end - timedelta(hours=7), predicted_pm25=12.0,
+            persistence_prediction=14.0, model_version="v1", model_artifact_sha256=artifact_sha,
+            feature_schema_sha256=schema_sha, artifact_version=1, feature_configuration="A2",
+            source_retrieved_at=target_interval_end - timedelta(hours=7),
+            input_data_cutoff=target_interval_end - timedelta(hours=7),
+            history_start=target_interval_end - timedelta(hours=31),
+            history_end=target_interval_end - timedelta(hours=8), data_mode_at_issue="fresh_openaq",
+            freshness_status_at_issue="fresh", source_age_minutes_at_issue=0,
+            issued_at=target_interval_end - timedelta(hours=6))
+        store.insert(forecast)
+        batch = AcquisitionBatch.create(sensor_id=forecast.sensor_id,
+            requested_interval_start=forecast.target_interval_start,
+            requested_interval_end=forecast.target_interval_end,
+            retrieved_at=forecast.target_interval_end + timedelta(hours=2),
+            source_endpoint="/sensors/13502151/hours", http_status=200,
+            raw_payload_sha256=(str(forecast.sensor_id) * 64)[:64],
+            normalized_payload_sha256="f" * 64, created_at=forecast.target_interval_end + timedelta(hours=2),
+            records=[{"sensor_id": forecast.sensor_id, "event_time": forecast.target_interval_start,
+                "period_end_utc": forecast.target_interval_end, "value_decimal": Decimal("10"),
+                "unit": "µg/m³", "record_id": forecast.sensor_id}])
+        GroundTruthReconciler(store, now=lambda: forecast.target_interval_end + timedelta(hours=2)).reconcile(forecast, batch)
+        return store.materialize_evaluation(forecast.forecast_id).record
+
+    def _consumer_publication(self, database, count, reference=None):
+        reference = reference or datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
+        store = SQLiteForecastStore(database)
+        store.initialize()
+        ict = ZoneInfo("Asia/Ho_Chi_Minh")
+        publication_date = reference.astimezone(ict).date()
+        end = datetime.combine(publication_date, time.min, ict).astimezone(timezone.utc)
+        start = end - timedelta(days=30)
+        for index in range(count):
+            self._consumer_evaluate(store, start + timedelta(hours=index))
+        publication = store.publish_consumer_performance(
+            "v1", sha256_file(self.artifact_path), feature_schema_sha256(), 13502151,
+            reference, reference, minimum_verified_count=48)
+        return store, publication
+
+    def test_consumer_performance_missing_store_is_unavailable_with_optional_nulls(self):
+        with self.client() as client:
+            response = client.get("/consumer/forecast-performance")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["available"], body["reason"]), (False, "reporting_unavailable"))
+        self.assertEqual(body["forecast_horizon_hours"], 6)
+        for field in ("range_start_utc", "range_end_utc", "verified_count", "mature_issued_count",
+                      "model_mae", "persistence_mae", "mae_difference", "published_at", "model_details"):
+            self.assertIsNone(body[field])
+
+    def test_consumer_performance_lookup_failure_is_unavailable_and_sanitized(self):
+        database = Path(self.directory.name) / "private-secret-ledger.sqlite3"
+        with patch("app.forecast_ledger.SQLiteForecastStore.current_consumer_performance",
+                   side_effect=RuntimeError(f"boom at {database}")):
+            with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+                response = client.get("/consumer/forecast-performance")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["available"], body["reason"]), (False, "reporting_unavailable"))
+        self.assertIsNone(body["model_details"])
+        self.assertNotIn(str(database), response.text)
+        self.assertNotIn("boom", response.text)
+
+    def test_consumer_performance_no_publication_is_unavailable_with_horizon(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        store = SQLiteForecastStore(database)
+        store.initialize()
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/consumer/forecast-performance")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["available"], body["reason"]), (False, "publication_unavailable"))
+        self.assertEqual(body["forecast_horizon_hours"], 6)
+        for field in ("range_start_utc", "range_end_utc", "verified_count", "mature_issued_count",
+                      "model_mae", "persistence_mae", "mae_difference", "published_at", "model_details"):
+            self.assertIsNone(body[field])
+
+    def test_consumer_performance_low_n_reports_insufficient_history_fields(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        _, publication = self._consumer_publication(database, 10)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/consumer/forecast-performance")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["available"], body["reason"]), (False, "insufficient_history"))
+        self.assertEqual(body["verified_count"], 10)
+        self.assertEqual(body["mature_issued_count"], 10)
+        self.assertIsNone(body["model_mae"])
+        self.assertIsNone(body["persistence_mae"])
+        self.assertIsNone(body["mae_difference"])
+        self.assertEqual(body["forecast_horizon_hours"], 6)
+        self.assertEqual(datetime.fromisoformat(body["published_at"]), publication.published_at)
+        self.assertEqual(datetime.fromisoformat(body["range_start_utc"]), publication.range_start_utc)
+        self.assertEqual(datetime.fromisoformat(body["range_end_utc"]), publication.range_end_utc)
+        self.assertEqual(body["model_details"], {"model_version": "v1", "evaluation_policy_version": 1})
+
+    def test_consumer_performance_sufficient_n_reports_metrics_and_model_details(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        _, publication = self._consumer_publication(database, 48)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/consumer/forecast-performance")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["available"])
+        self.assertIsNone(body["reason"])
+        self.assertEqual(body["verified_count"], 48)
+        self.assertEqual(body["mature_issued_count"], 48)
+        self.assertEqual(body["model_mae"], publication.model_mae)
+        self.assertEqual(body["persistence_mae"], publication.persistence_mae)
+        self.assertEqual(body["mae_difference"], publication.mae_difference)
+        self.assertIsNotNone(body["model_mae"])
+        self.assertIsNotNone(body["persistence_mae"])
+        self.assertEqual(body["model_details"], {"model_version": "v1", "evaluation_policy_version": 1})
+
+    def test_consumer_performance_survives_live_forecast_path_mocked_to_fail(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        self._consumer_publication(database, 48)
+        with patch("app.main.sha256_file", side_effect=OSError("model artifact unavailable")):
+            with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+                response = client.get("/consumer/forecast-performance")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["available"], body["reason"]), (False, "reporting_unavailable"))
+        self.assertIsNone(body["model_details"])
+
+    def test_consumer_performance_never_exposes_internal_identifiers_or_errors(self):
+        database = Path(self.directory.name) / "ledger.sqlite3"
+        _, publication = self._consumer_publication(database, 48)
+        with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
+            response = client.get("/consumer/forecast-performance")
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(body), {"available", "reason", "range_start_utc", "range_end_utc",
+            "verified_count", "mature_issued_count", "model_mae", "persistence_mae", "mae_difference",
+            "forecast_horizon_hours", "published_at", "model_details"})
+        self.assertEqual(set(body["model_details"]), {"model_version", "evaluation_policy_version"})
+        text = response.text
+        for secret in (publication.publication_id, publication.snapshot_id, publication.membership_sha256,
+                       publication.model_artifact_sha256, publication.feature_schema_sha256,
+                       str(publication.sensor_id)):
+            self.assertNotIn(secret, text)
+        self.assertNotIn(str(database), text)
 
 
 class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):

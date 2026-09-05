@@ -6,9 +6,10 @@ import unicodedata
 import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from scripts.modeling.features import FORECAST_HORIZON_HOURS, TARGET_COLUMN, V1_FEATURE_COLUMNS
 
@@ -16,7 +17,8 @@ from scripts.modeling.features import FORECAST_HORIZON_HOURS, TARGET_COLUMN, V1_
 FORECAST_NAMESPACE = uuid.UUID("e60f879b-90cf-51a4-8936-aad3c962371c")
 EVALUATION_NAMESPACE = uuid.UUID("1e772429-52c1-5f08-a957-88d6a5f5abbd")
 EVALUATION_RUN_NAMESPACE = uuid.UUID("3c03496f-c34f-5b71-a62a-3a3b6430c613")
-SCHEMA_VERSION = 7
+CONSUMER_PUBLICATION_NAMESPACE = uuid.UUID("16ca2b67-725b-52f8-9a45-9c085fd6307d")
+SCHEMA_VERSION = 8
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -120,6 +122,30 @@ class EvaluationRunSnapshot:
 class EvaluationRunResult:
     status: str
     snapshot: EvaluationRunSnapshot
+
+
+@dataclass(frozen=True)
+class ConsumerPerformancePublication:
+    publication_id: str
+    publication_date: str
+    range_start_utc: datetime
+    range_end_utc: datetime
+    model_version: str
+    model_artifact_sha256: str
+    feature_schema_sha256: str
+    sensor_id: int
+    evaluation_policy_version: int
+    forecast_horizon_hours: int
+    verified_count: int
+    mature_issued_count: int
+    available: bool
+    reason: str | None
+    model_mae: float | None
+    persistence_mae: float | None
+    mae_difference: float | None
+    snapshot_id: str | None
+    membership_sha256: str
+    published_at: datetime
 
 
 def _utc(value, name, hour_aligned=False):
@@ -420,6 +446,40 @@ class SQLiteForecastStore:
                 or any(not row[3] for row in info if row[1] not in {"model_mae", "model_rmse", "persistence_mae", "persistence_rmse", "mae_improvement", "rmse_improvement", "mae_improvement_percent", "rmse_improvement_percent"})):
             raise RuntimeError("unsupported schema")
 
+    def _create_m8_schema(self, connection):
+        connection.execute("""CREATE TABLE IF NOT EXISTS consumer_performance_publications (
+            publication_id TEXT NOT NULL PRIMARY KEY, publication_date TEXT NOT NULL,
+            range_start_utc TEXT NOT NULL, range_end_utc TEXT NOT NULL,
+            model_version TEXT NOT NULL, model_artifact_sha256 TEXT NOT NULL,
+            feature_schema_sha256 TEXT NOT NULL, sensor_id INTEGER NOT NULL,
+            evaluation_policy_version INTEGER NOT NULL, forecast_horizon_hours INTEGER NOT NULL,
+            verified_count INTEGER NOT NULL, mature_issued_count INTEGER NOT NULL,
+            available INTEGER NOT NULL, reason TEXT, model_mae REAL, persistence_mae REAL,
+            mae_difference REAL, snapshot_id TEXT, membership_sha256 TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            UNIQUE(publication_date, model_version, model_artifact_sha256, feature_schema_sha256,
+                sensor_id, evaluation_policy_version, forecast_horizon_hours, membership_sha256,
+                mature_issued_count),
+            FOREIGN KEY(snapshot_id) REFERENCES evaluation_run_snapshots(snapshot_id))""")
+        connection.execute("""CREATE INDEX IF NOT EXISTS consumer_performance_current_idx
+            ON consumer_performance_publications (publication_date, model_version,
+                model_artifact_sha256, feature_schema_sha256, sensor_id,
+                evaluation_policy_version, forecast_horizon_hours, published_at)""")
+
+    def _validate_m8_schema(self, connection):
+        expected = {"publication_id", "publication_date", "range_start_utc", "range_end_utc",
+            "model_version", "model_artifact_sha256", "feature_schema_sha256", "sensor_id",
+            "evaluation_policy_version", "forecast_horizon_hours", "verified_count",
+            "mature_issued_count", "available", "reason", "model_mae", "persistence_mae",
+            "mae_difference", "snapshot_id", "membership_sha256", "published_at"}
+        info = list(connection.execute("PRAGMA table_info(consumer_performance_publications)"))
+        if {row[1] for row in info} != expected or {row[1] for row in info if row[5]} != {"publication_id"}:
+            raise RuntimeError("unsupported schema")
+        foreign = {(row[3], row[2], row[4]) for row in connection.execute(
+            "PRAGMA foreign_key_list(consumer_performance_publications)")}
+        if foreign != {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")}:
+            raise RuntimeError("unsupported schema")
+
     def _create_m2_schema(self, connection):
         connection.execute("""CREATE TABLE observation_acquisitions (
             acquisition_id TEXT PRIMARY KEY, sensor_id INTEGER NOT NULL,
@@ -454,7 +514,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-            required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors"}
+            required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications"}
             if version != SCHEMA_VERSION or not required <= tables:
                 raise RuntimeError("unsupported schema")
             self._validate_forecasts_schema(connection)
@@ -462,6 +522,7 @@ class SQLiteForecastStore:
             self._validate_m3_schema(connection)
             self._validate_m4_schema(connection)
             self._validate_m6_schema(connection)
+            self._validate_m8_schema(connection)
 
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,13 +535,14 @@ class SQLiteForecastStore:
                 raise RuntimeError("unsupported schema")
             if version == SCHEMA_VERSION:
                 self._validate_forecasts_schema(connection)
-                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors"}
+                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications"}
                 if not required <= tables:
                     raise RuntimeError("unsupported schema")
                 self._validate_m2_schema(connection)
                 self._validate_m3_schema(connection)
                 self._validate_m4_schema(connection)
                 self._validate_m6_schema(connection)
+                self._validate_m8_schema(connection)
                 return
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -508,6 +570,8 @@ class SQLiteForecastStore:
                     self._create_m5_schema(connection)
                     self._create_m6_schema(connection)
                     self._backfill_evaluation_cohort_cursors(connection)
+                    self._create_m8_schema(connection)
+                    self._validate_m8_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -522,6 +586,8 @@ class SQLiteForecastStore:
                         raise RuntimeError("unsupported schema")
                     self._create_m6_schema(connection)
                     self._backfill_evaluation_cohort_cursors(connection)
+                    self._create_m8_schema(connection)
+                    self._validate_m8_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -533,6 +599,19 @@ class SQLiteForecastStore:
                     self._validate_m6_schema(connection)
                     connection.execute("DELETE FROM evaluation_cohort_cursors")
                     self._backfill_evaluation_cohort_cursors(connection)
+                    self._create_m8_schema(connection)
+                    self._validate_m8_schema(connection)
+                    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    connection.commit()
+                    return
+                elif version == 7:
+                    self._validate_forecasts_schema(connection)
+                    self._validate_m2_schema(connection)
+                    self._validate_m3_schema(connection)
+                    self._validate_m4_schema(connection)
+                    self._validate_m6_schema(connection)
+                    self._create_m8_schema(connection)
+                    self._validate_m8_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -541,6 +620,7 @@ class SQLiteForecastStore:
                 self._create_m4_schema(connection)
                 self._create_m5_schema(connection)
                 self._create_m6_schema(connection)
+                self._create_m8_schema(connection)
                 self._backfill_evaluation_cohort_cursors(connection)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 connection.commit()
@@ -966,37 +1046,47 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                rows = self._evaluation_cohort_rows(connection, model_version, model_artifact_sha256, feature_schema_sha256,
-                    sensor_id, target_interval_end_start, target_interval_end_end, evaluation_policy_version)
-                start = _utc(target_interval_end_start, "target_interval_end_start", True)
-                end = _utc(target_interval_end_end, "target_interval_end_end", True)
-                evaluation_ids = tuple(row["evaluation_id"] for row in rows)
-                identity = json.dumps({"snapshot_identity_version": 1, "evaluation_policy_version": evaluation_policy_version,
-                    "model_version": model_version, "model_artifact_sha256": model_artifact_sha256,
-                    "feature_schema_sha256": feature_schema_sha256, "sensor_id": sensor_id,
-                    "target_interval_end_start": _timestamp(start), "target_interval_end_end": _timestamp(end),
-                    "evaluation_ids": evaluation_ids}, sort_keys=True, separators=(",", ":"))
-                snapshot_id = str(uuid.uuid5(EVALUATION_RUN_NAMESPACE, identity))
-                existing = connection.execute("SELECT * FROM evaluation_run_snapshots WHERE snapshot_id=?", (snapshot_id,)).fetchone()
-                if existing is not None:
-                    snapshot = self._snapshot_row(connection, existing)
-                    if snapshot.evaluation_ids != evaluation_ids or snapshot.metrics != self._evaluation_metrics(rows):
-                        raise ForecastIntegrityError("snapshot does not match selected evaluations")
-                    connection.commit()
-                    return EvaluationRunResult("already_exists", snapshot)
-                metrics = self._evaluation_metrics(rows)
-                connection.execute("INSERT INTO evaluation_run_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (snapshot_id, evaluation_policy_version, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
-                    _timestamp(start), _timestamp(end), json.dumps(evaluation_ids, separators=(",", ":")), metrics.count,
-                    metrics.model_mae, metrics.model_rmse, metrics.persistence_mae, metrics.persistence_rmse,
-                    metrics.mae_improvement, metrics.rmse_improvement, metrics.mae_improvement_percent,
-                    metrics.rmse_improvement_percent, _timestamp(created_at)))
+                result = self._create_evaluation_run_snapshot(connection, model_version,
+                    model_artifact_sha256, feature_schema_sha256, sensor_id,
+                    target_interval_end_start, target_interval_end_end, created_at,
+                    evaluation_policy_version)
                 connection.commit()
-                return EvaluationRunResult("inserted", EvaluationRunSnapshot(snapshot_id, evaluation_policy_version, model_version,
-                    model_artifact_sha256, feature_schema_sha256, sensor_id, start, end, evaluation_ids, metrics, created_at))
+                return result
             except Exception:
                 connection.rollback()
                 raise
+
+    def _create_evaluation_run_snapshot(self, connection, model_version, model_artifact_sha256,
+                                        feature_schema_sha256, sensor_id, target_interval_end_start,
+                                        target_interval_end_end, created_at, evaluation_policy_version=1,
+                                        rows=None):
+        rows = rows if rows is not None else self._evaluation_cohort_rows(connection, model_version,
+            model_artifact_sha256, feature_schema_sha256, sensor_id, target_interval_end_start,
+            target_interval_end_end, evaluation_policy_version)
+        start = _utc(target_interval_end_start, "target_interval_end_start", True)
+        end = _utc(target_interval_end_end, "target_interval_end_end", True)
+        evaluation_ids = tuple(row["evaluation_id"] for row in rows)
+        identity = json.dumps({"snapshot_identity_version": 1, "evaluation_policy_version": evaluation_policy_version,
+            "model_version": model_version, "model_artifact_sha256": model_artifact_sha256,
+            "feature_schema_sha256": feature_schema_sha256, "sensor_id": sensor_id,
+            "target_interval_end_start": _timestamp(start), "target_interval_end_end": _timestamp(end),
+            "evaluation_ids": evaluation_ids}, sort_keys=True, separators=(",", ":"))
+        snapshot_id = str(uuid.uuid5(EVALUATION_RUN_NAMESPACE, identity))
+        existing = connection.execute("SELECT * FROM evaluation_run_snapshots WHERE snapshot_id=?", (snapshot_id,)).fetchone()
+        metrics = self._evaluation_metrics(rows)
+        if existing is not None:
+            snapshot = self._snapshot_row(connection, existing)
+            if snapshot.evaluation_ids != evaluation_ids or snapshot.metrics != metrics:
+                raise ForecastIntegrityError("snapshot does not match selected evaluations")
+            return EvaluationRunResult("already_exists", snapshot)
+        connection.execute("INSERT INTO evaluation_run_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (snapshot_id, evaluation_policy_version, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+            _timestamp(start), _timestamp(end), json.dumps(evaluation_ids, separators=(",", ":")), metrics.count,
+            metrics.model_mae, metrics.model_rmse, metrics.persistence_mae, metrics.persistence_rmse,
+            metrics.mae_improvement, metrics.rmse_improvement, metrics.mae_improvement_percent,
+            metrics.rmse_improvement_percent, _timestamp(created_at)))
+        return EvaluationRunResult("inserted", EvaluationRunSnapshot(snapshot_id, evaluation_policy_version, model_version,
+            model_artifact_sha256, feature_schema_sha256, sensor_id, start, end, evaluation_ids, metrics, created_at))
 
     def _snapshot_row(self, connection, row):
         try:
@@ -1078,6 +1168,95 @@ class SQLiteForecastStore:
                 if snapshot.evaluation_ids == current_evaluation_ids:
                     return snapshot
             return None
+
+    def _consumer_publication_row(self, row):
+        if row is None:
+            return None
+        return ConsumerPerformancePublication(
+            row["publication_id"], row["publication_date"], _parse_timestamp(row["range_start_utc"]),
+            _parse_timestamp(row["range_end_utc"]), row["model_version"], row["model_artifact_sha256"],
+            row["feature_schema_sha256"], row["sensor_id"], row["evaluation_policy_version"],
+            row["forecast_horizon_hours"], row["verified_count"], row["mature_issued_count"],
+            bool(row["available"]), row["reason"], row["model_mae"], row["persistence_mae"],
+            row["mae_difference"], row["snapshot_id"], row["membership_sha256"],
+            _parse_timestamp(row["published_at"]))
+
+    def publish_consumer_performance(self, model_version, model_artifact_sha256,
+                                     feature_schema_sha256, sensor_id, reference_time,
+                                     published_at=None, evaluation_policy_version=1,
+                                     forecast_horizon_hours=6, minimum_verified_count=48):
+        reference = _utc(reference_time, "reference_time")
+        published = _utc(published_at or reference, "published_at")
+        ict = ZoneInfo("Asia/Ho_Chi_Minh")
+        publication_date = reference.astimezone(ict).date()
+        end = datetime.combine(publication_date, time.min, ict).astimezone(timezone.utc)
+        start = end - timedelta(days=30)
+        _hash(model_artifact_sha256, "model_artifact_sha256")
+        _hash(feature_schema_sha256, "feature_schema_sha256")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._evaluation_cohort_rows(connection, model_version, model_artifact_sha256,
+                    feature_schema_sha256, sensor_id, start, end, evaluation_policy_version)
+                evaluation_ids = tuple(row["evaluation_id"] for row in rows)
+                mature_count = connection.execute("""SELECT COUNT(*) FROM forecasts
+                WHERE model_version=? AND model_artifact_sha256=? AND feature_schema_sha256=?
+                AND sensor_id=? AND forecast_horizon_hours=? AND issuance_mode='scheduled'
+                AND target_interval_end>=? AND target_interval_end<? AND target_interval_end<=?""",
+                    (model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                     forecast_horizon_hours, _timestamp(start), _timestamp(end),
+                     _timestamp(reference - timedelta(minutes=120)))).fetchone()[0]
+                verified_count = len(rows)
+                if verified_count > mature_count:
+                    raise ForecastIntegrityError("verified count exceeds mature issued count")
+                snapshot = None
+                if verified_count:
+                    snapshot = self._create_evaluation_run_snapshot(connection, model_version,
+                        model_artifact_sha256, feature_schema_sha256, sensor_id, start, end,
+                        published, evaluation_policy_version, rows).snapshot
+                membership = hashlib.sha256(json.dumps(evaluation_ids, separators=(",", ":")).encode()).hexdigest()
+                available = verified_count >= minimum_verified_count
+                metrics = self._evaluation_metrics(rows) if available else None
+                identity = json.dumps({"consumer_publication_identity_version": 1,
+            "publication_date": publication_date.isoformat(), "model_version": model_version,
+            "model_artifact_sha256": model_artifact_sha256,
+            "feature_schema_sha256": feature_schema_sha256, "sensor_id": sensor_id,
+            "evaluation_policy_version": evaluation_policy_version,
+            "forecast_horizon_hours": forecast_horizon_hours, "membership_sha256": membership,
+            "mature_issued_count": mature_count}, sort_keys=True, separators=(",", ":"))
+                publication_id = str(uuid.uuid5(CONSUMER_PUBLICATION_NAMESPACE, identity))
+                values = (publication_id, publication_date.isoformat(), _timestamp(start), _timestamp(end),
+            model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+            evaluation_policy_version, forecast_horizon_hours, verified_count, mature_count,
+            int(available), None if available else "insufficient_history",
+            metrics.model_mae if metrics else None, metrics.persistence_mae if metrics else None,
+            metrics.mae_improvement if metrics else None, snapshot.snapshot_id if snapshot else None,
+            membership, _timestamp(published))
+                existing = connection.execute("SELECT * FROM consumer_performance_publications WHERE publication_id=?",
+                    (publication_id,)).fetchone()
+                if existing is None:
+                    connection.execute("INSERT INTO consumer_performance_publications VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+                    existing = connection.execute("SELECT * FROM consumer_performance_publications WHERE publication_id=?",
+                        (publication_id,)).fetchone()
+                elif tuple(existing)[:-1] != values[:-1]:
+                    raise ForecastIntegrityError("publication does not match selected evaluations")
+                connection.commit()
+                return self._consumer_publication_row(existing)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def current_consumer_performance(self, model_version, model_artifact_sha256,
+                                     feature_schema_sha256, sensor_id,
+                                     evaluation_policy_version=1, forecast_horizon_hours=6):
+        with closing(self._connect()) as connection:
+            row = connection.execute("""SELECT * FROM consumer_performance_publications
+                WHERE model_version=? AND model_artifact_sha256=? AND feature_schema_sha256=?
+                AND sensor_id=? AND evaluation_policy_version=? AND forecast_horizon_hours=?
+                ORDER BY publication_date DESC, published_at DESC, rowid DESC LIMIT 1""",
+                (model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                 evaluation_policy_version, forecast_horizon_hours)).fetchone()
+            return self._consumer_publication_row(row)
 
     def get_evaluation(self, forecast_id):
         with closing(self._connect()) as connection:
