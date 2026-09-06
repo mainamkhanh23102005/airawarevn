@@ -15,7 +15,7 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from app.forecast_ledger import ForecastIntegrityError, ForecastRecord, SQLiteForecastStore
+from app.forecast_ledger import ForecastIntegrityError, ForecastRecord, LedgerDatabaseError, SQLiteForecastStore
 from app.ground_truth_reconciler import (
     ACQUISITION_NAMESPACE,
     RECONCILIATION_NAMESPACE,
@@ -412,7 +412,7 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_database_failure_returns_frozen_classification_without_partial_rows(self):
         store, reconciler = self._reconciler()
-        with patch.object(store, "settle", side_effect=sqlite3.OperationalError("boom")):
+        with patch.object(store, "settle", side_effect=LedgerDatabaseError("boom")):
             result = reconciler.reconcile(self.forecast, self._batch())
         self.assertEqual((result.status, result.reason_code), ("failed", "database_error"))
         self.assertEqual(store.count_acquisitions(), 0)

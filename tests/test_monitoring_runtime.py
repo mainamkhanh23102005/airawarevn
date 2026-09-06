@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts import run_monitoring_cycle
@@ -16,32 +16,36 @@ class MonitoringCycleTests(unittest.TestCase):
         issue = object()
         reconciliation = object()
         evaluation = object()
+        store = Mock()
         with patch.object(run_monitoring_cycle, "issue_forecast", return_value=issue) as issue_forecast, patch.object(
                 run_monitoring_cycle, "run_reconciliation", return_value=reconciliation) as reconcile, patch.object(
-                run_monitoring_cycle.SQLiteForecastStore, "initialize") as initialize, patch.object(
+                run_monitoring_cycle, "create_forecast_store", return_value=store) as create_store, patch.object(
                 run_monitoring_cycle, "materialize_available_evaluations", return_value=evaluation) as materialize:
             result = run_monitoring_cycle.run_monitoring_cycle("ledger.sqlite3", "raw", "key", "model.joblib", "current.json")
         self.assertEqual(result, (issue, reconciliation, evaluation))
         issue_forecast.assert_called_once()
         reconcile.assert_called_once()
-        initialize.assert_called_once()
-        materialize.assert_called_once()
+        create_store.assert_called_once_with("ledger.sqlite3")
+        store.initialize.assert_called_once()
+        materialize.assert_called_once_with(store)
 
     def test_monitoring_cycle_owns_ledger_initialization(self):
+        store = Mock()
         with patch.object(run_monitoring_cycle, "issue_forecast"), patch.object(
                 run_monitoring_cycle, "run_reconciliation"), patch.object(
-                run_monitoring_cycle.SQLiteForecastStore, "initialize") as initialize, patch.object(
+                run_monitoring_cycle, "create_forecast_store", return_value=store), patch.object(
                 run_monitoring_cycle, "materialize_available_evaluations"):
             run_monitoring_cycle.run_monitoring_cycle("ledger.sqlite3", "raw", "key", "model.joblib", "current.json")
-        initialize.assert_called_once()
+        store.initialize.assert_called_once()
 
     def test_missing_model_materializes_without_consumer_cohort(self):
         with tempfile.TemporaryDirectory() as directory:
             missing = Path(directory) / "absent.joblib"
             evaluation = object()
+            store = Mock()
             with patch.object(run_monitoring_cycle, "issue_forecast"), patch.object(
                     run_monitoring_cycle, "run_reconciliation"), patch.object(
-                    run_monitoring_cycle.SQLiteForecastStore, "initialize"), patch.object(
+                    run_monitoring_cycle, "create_forecast_store", return_value=store), patch.object(
                     run_monitoring_cycle, "materialize_available_evaluations", return_value=evaluation) as materialize:
                 result = run_monitoring_cycle.run_monitoring_cycle("ledger.sqlite3", "raw", "key", missing, "current.json")
             self.assertIs(result[2], evaluation)
@@ -56,9 +60,10 @@ class MonitoringCycleTests(unittest.TestCase):
             model_path.write_bytes(b"model-bytes")
             reference = datetime(2026, 1, 2, 3, 15, 0, tzinfo=ICT).astimezone(timezone.utc)
             evaluation = object()
+            store = Mock()
             with patch.object(run_monitoring_cycle, "issue_forecast"), patch.object(
                     run_monitoring_cycle, "run_reconciliation"), patch.object(
-                    run_monitoring_cycle.SQLiteForecastStore, "initialize"), patch.object(
+                    run_monitoring_cycle, "create_forecast_store", return_value=store), patch.object(
                     run_monitoring_cycle, "sha256_file", return_value="c" * 64) as sha, patch.object(
                     run_monitoring_cycle, "feature_schema_sha256", return_value="d" * 64) as schema, patch.object(
                     run_monitoring_cycle, "materialize_available_evaluations", return_value=evaluation) as materialize:

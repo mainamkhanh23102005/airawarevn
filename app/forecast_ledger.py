@@ -1,12 +1,14 @@
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import unicodedata
 import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass, fields
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -26,6 +28,18 @@ IDENTITY_FIELDS = (
 
 
 class ForecastIntegrityError(Exception):
+    pass
+
+
+class LedgerDatabaseError(Exception):
+    pass
+
+
+class LedgerTransientError(LedgerDatabaseError):
+    pass
+
+
+class ForecastStoreConfigurationError(ValueError):
     pass
 
 
@@ -291,10 +305,47 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def _translate_sqlite_errors(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            error_type = LedgerTransientError if "locked" in message or "busy" in message else LedgerDatabaseError
+            raise error_type(str(error)) from error
+        except sqlite3.Error as error:
+            raise LedgerDatabaseError(str(error)) from error
+    return wrapped
+
+
 class ForecastStore(Protocol):
+    def validate_existing(self): ...
     def initialize(self): ...
     def insert(self, record): ...
+    def get_by_id(self, forecast_id): ...
+    def get_by_identity(self, record): ...
     def latest(self): ...
+    def eligible_forecasts(self, now, delay_minutes, limit=None): ...
+    def forecasts_for_targets(self, targets): ...
+    def persist_acquisition(self, batch): ...
+    def settle(self, forecast, batch, candidates, reconciled_at, policy): ...
+    def materialize_evaluation(self, forecast_id, evaluated_at=None): ...
+    def pending_evaluation_forecast_ids(self, limit=None): ...
+    def pending_evaluation_snapshot_forecast_ids(self, limit=None): ...
+    def pending_evaluation_snapshot_windows(self, limit=None): ...
+    def create_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                       target_interval_end_start, target_interval_end_end, created_at,
+                                       evaluation_policy_version=1): ...
+    def find_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                     target_interval_end_start, target_interval_end_end,
+                                     evaluation_policy_version=1): ...
+    def publish_consumer_performance(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                     reference_time, published_at=None, evaluation_policy_version=1,
+                                     forecast_horizon_hours=6, minimum_verified_count=48): ...
+    def current_consumer_performance(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                     evaluation_policy_version=1, forecast_horizon_hours=6): ...
+    def get_evaluation(self, forecast_id): ...
 
 
 class SQLiteForecastStore:
@@ -510,6 +561,7 @@ class SQLiteForecastStore:
             FOREIGN KEY(reconciliation_id) REFERENCES forecast_reconciliations(reconciliation_id),
             FOREIGN KEY(acquisition_id) REFERENCES observation_acquisitions(acquisition_id))""")
 
+    @_translate_sqlite_errors
     def validate_existing(self):
         with closing(self._connect()) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -524,6 +576,7 @@ class SQLiteForecastStore:
             self._validate_m6_schema(connection)
             self._validate_m8_schema(connection)
 
+    @_translate_sqlite_errors
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
@@ -634,6 +687,7 @@ class SQLiteForecastStore:
     def _values(self, record):
         return tuple(_timestamp(value) if isinstance(value, datetime) else value for value in asdict(record).values())
 
+    @_translate_sqlite_errors
     def insert(self, record):
         expected_id = str(uuid.uuid5(FORECAST_NAMESPACE, canonical_identity_json(record)))
         if record.forecast_id != expected_id:
@@ -666,18 +720,22 @@ class SQLiteForecastStore:
         values = tuple(_timestamp(getattr(record, name)) if isinstance(getattr(record, name), datetime) else getattr(record, name) for name in IDENTITY_FIELDS)
         return self._row(connection.execute(f"SELECT * FROM forecasts WHERE {where}", values).fetchone())
 
+    @_translate_sqlite_errors
     def get_by_id(self, forecast_id):
         with closing(self._connect()) as connection:
             return self._row(connection.execute("SELECT * FROM forecasts WHERE forecast_id=?", (forecast_id,)).fetchone())
 
+    @_translate_sqlite_errors
     def get_by_identity(self, record):
         with closing(self._connect()) as connection:
             return self._get_by_identity_connection(connection, record)
 
+    @_translate_sqlite_errors
     def latest(self):
         with closing(self._connect()) as connection:
             return self._row(connection.execute("SELECT * FROM forecasts ORDER BY issued_at DESC, rowid DESC LIMIT 1").fetchone())
 
+    @_translate_sqlite_errors
     def eligible_forecasts(self, now, delay_minutes, limit=None):
         cutoff = _timestamp(_utc(now, "now") - timedelta(minutes=delay_minutes))
         sql = """SELECT forecasts.* FROM forecasts
@@ -691,6 +749,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return [self._row(row) for row in connection.execute(sql, parameters)]
 
+    @_translate_sqlite_errors
     def forecasts_for_targets(self, targets):
         if not targets:
             return []
@@ -724,12 +783,14 @@ class SQLiteForecastStore:
         if existing is None or tuple(existing) != values:
             raise ForecastIntegrityError("immutable acquisition conflict")
 
+    @_translate_sqlite_errors
     def persist_acquisition(self, batch):
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._persist_acquisition_connection(connection, batch)
             connection.commit()
 
+    @_translate_sqlite_errors
     def settle(self, forecast, batch, candidates, reconciled_at, policy):
         from app.ground_truth_reconciler import ReconcileResult, _canonical_json, _identity, normalized_sha256, RECONCILIATION_NAMESPACE, REVISION_NAMESPACE
         value_text = candidates[0][1]
@@ -899,6 +960,7 @@ class SQLiteForecastStore:
             evaluated_at or _parse_timestamp(row["reconciled_at"]))
         return self._persist_evaluation_connection(connection, record)
 
+    @_translate_sqlite_errors
     def materialize_evaluation(self, forecast_id, evaluated_at=None):
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -906,6 +968,7 @@ class SQLiteForecastStore:
             connection.commit()
             return result
 
+    @_translate_sqlite_errors
     def pending_evaluation_forecast_ids(self, limit=None):
         sql = """SELECT forecast_reconciliations.forecast_id FROM forecast_reconciliations
             LEFT JOIN evaluation_rows USING(forecast_id) WHERE evaluation_rows.forecast_id IS NULL
@@ -919,6 +982,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return [row[0] for row in connection.execute(sql, parameters)]
 
+    @_translate_sqlite_errors
     def pending_evaluation_snapshot_forecast_ids(self, limit=None):
         sql = """SELECT evaluation_rows.forecast_id FROM evaluation_rows JOIN forecasts USING(forecast_id)
             WHERE NOT EXISTS (SELECT 1 FROM evaluation_run_snapshots WHERE evaluation_run_snapshots.evaluation_policy_version=evaluation_rows.evaluation_policy_version
@@ -938,6 +1002,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return [row[0] for row in connection.execute(sql, parameters)]
 
+    @_translate_sqlite_errors
     def pending_evaluation_snapshot_windows(self, limit=None):
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError("limit must be a positive integer")
@@ -1039,6 +1104,7 @@ class SQLiteForecastStore:
                 sensor_id, target_interval_end_start, target_interval_end_end, evaluation_policy_version)
             return self._evaluation_metrics(rows)
 
+    @_translate_sqlite_errors
     def create_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
                                        target_interval_end_start, target_interval_end_end, created_at,
                                        evaluation_policy_version=1):
@@ -1132,6 +1198,7 @@ class SQLiteForecastStore:
         except (TypeError, ValueError, ForecastIntegrityError, json.JSONDecodeError) as error:
             raise ForecastIntegrityError("invalid durable snapshot") from error
 
+    @_translate_sqlite_errors
     def find_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
                                      target_interval_end_start, target_interval_end_end, evaluation_policy_version=1):
         if not isinstance(model_version, str) or not model_version or type(sensor_id) is not int or sensor_id <= 0:
@@ -1181,6 +1248,7 @@ class SQLiteForecastStore:
             row["mae_difference"], row["snapshot_id"], row["membership_sha256"],
             _parse_timestamp(row["published_at"]))
 
+    @_translate_sqlite_errors
     def publish_consumer_performance(self, model_version, model_artifact_sha256,
                                      feature_schema_sha256, sensor_id, reference_time,
                                      published_at=None, evaluation_policy_version=1,
@@ -1246,6 +1314,7 @@ class SQLiteForecastStore:
                 connection.rollback()
                 raise
 
+    @_translate_sqlite_errors
     def current_consumer_performance(self, model_version, model_artifact_sha256,
                                      feature_schema_sha256, sensor_id,
                                      evaluation_policy_version=1, forecast_horizon_hours=6):
@@ -1258,6 +1327,7 @@ class SQLiteForecastStore:
                  evaluation_policy_version, forecast_horizon_hours)).fetchone()
             return self._consumer_publication_row(row)
 
+    @_translate_sqlite_errors
     def get_evaluation(self, forecast_id):
         with closing(self._connect()) as connection:
             return self._evaluation_row(connection.execute("SELECT * FROM evaluation_rows WHERE forecast_id=?", (forecast_id,)).fetchone())
@@ -1284,6 +1354,15 @@ class SQLiteForecastStore:
             return connection.execute("SELECT COUNT(*) FROM observation_revisions").fetchone()[0]
 
 
+def create_forecast_store(path, read_only=False):
+    selected_backend = os.environ.get("AIRAWARE_LEDGER_BACKEND", "sqlite").strip().lower()
+    if selected_backend == "sqlite":
+        return SQLiteForecastStore(path, read_only=read_only)
+    raise ForecastStoreConfigurationError(
+        f"unsupported AIRAWARE_LEDGER_BACKEND={selected_backend!r}; supported backends: sqlite"
+    )
+
+
 def _record_json(record):
     payload = asdict(record)
     for field in fields(record):
@@ -1300,7 +1379,7 @@ def _record_from_json(value):
 
 
 def issue_forecast(database_path, model_path, current_pm25_path, now=lambda: datetime.now(timezone.utc)):
-    store = SQLiteForecastStore(database_path)
+    store = create_forecast_store(database_path)
     try:
         from app.main import MODEL_VERSION, _current_prediction_request, _load_current_artifact, _predict, _validate_metadata
         from scripts.modeling.predict import load_artifact

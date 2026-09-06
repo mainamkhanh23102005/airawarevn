@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.evaluation_monitor import materialize_available_evaluations
-from app.forecast_ledger import (SQLiteForecastStore, feature_schema_sha256,
+from app.forecast_ledger import (create_forecast_store, feature_schema_sha256,
                                  issue_forecast, sha256_file)
 from app.main import MODEL_VERSION
 from scripts.modeling.features import FORECAST_HORIZON_HOURS
@@ -20,7 +20,7 @@ def run_monitoring_cycle(database, raw_directory, api_key, model_path=DEFAULT_MO
                          current_pm25_path=DEFAULT_CURRENT_PM25_PATH, now=lambda: datetime.now(timezone.utc)):
     issue = issue_forecast(database, model_path, current_pm25_path, now=now)
     reconciliation = run_reconciliation(database, raw_directory, api_key, now=now)
-    store = SQLiteForecastStore(database)
+    store = create_forecast_store(database)
     store.initialize()
     reference = now().astimezone(timezone.utc)
     if Path(model_path).is_file():

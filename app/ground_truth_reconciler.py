@@ -3,12 +3,19 @@ import json
 import math
 import unicodedata
 import uuid
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
-from app.forecast_ledger import ForecastIntegrityError, _hash, _parse_timestamp, _timestamp, _utc
+from app.forecast_ledger import (
+    ForecastIntegrityError,
+    ForecastStore,
+    LedgerDatabaseError,
+    _hash,
+    _parse_timestamp,
+    _timestamp,
+    _utc,
+)
 
 
 ACQUISITION_NAMESPACE = uuid.UUID("4153ba6e-a333-57b1-8dfe-8b58604bdc30")
@@ -167,7 +174,7 @@ class SourceParseError(Exception):
 
 
 class GroundTruthReconciler:
-    def __init__(self, store, now, policy=TruthPolicy(), source=None, limit=None):
+    def __init__(self, store: ForecastStore, now, policy=TruthPolicy(), source=None, limit=None):
         self.store = store
         self.now = now
         self.policy = policy
@@ -292,5 +299,5 @@ class GroundTruthReconciler:
                 self.store.persist_acquisition(batch)
                 return ReconcileResult("pending", reason)
             return self.store.settle(forecast, batch, candidates, reconciliation_now, self.policy)
-        except sqlite3.Error:
+        except LedgerDatabaseError:
             return ReconcileResult("failed", "database_error")

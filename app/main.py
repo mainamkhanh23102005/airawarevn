@@ -3,7 +3,6 @@ import json
 import logging
 import math
 import os
-import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.forecast_ledger import SQLiteForecastStore, feature_schema_sha256, sha256_file
+from app.forecast_ledger import LedgerDatabaseError, create_forecast_store, feature_schema_sha256, sha256_file
 from scripts.modeling.features import (
     FORECAST_HORIZON_HOURS,
     V1_FEATURE_COLUMNS,
@@ -397,11 +396,11 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         application.state.forecast_store = None
         if configured_ledger_path:
             systemd_monitoring = os.environ.get("AIRAWARE_SYSTEMD_MONITORING_ENABLED") == "1"
-            store = SQLiteForecastStore(configured_ledger_path, read_only=systemd_monitoring)
+            store = create_forecast_store(configured_ledger_path, read_only=systemd_monitoring)
             if systemd_monitoring:
                 try:
                     store.validate_existing()
-                except (OSError, RuntimeError, sqlite3.Error):
+                except (OSError, RuntimeError, LedgerDatabaseError):
                     logger.exception("Systemd API ledger validation failed")
                 else:
                     application.state.forecast_store = store
@@ -585,7 +584,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         if store is not None:
             try:
                 record = store.latest()
-            except sqlite3.Error as error:
+            except LedgerDatabaseError as error:
                 raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
             if record is None:
                 raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL)

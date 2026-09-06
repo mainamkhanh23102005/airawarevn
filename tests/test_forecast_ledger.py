@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import tempfile
 import threading
@@ -18,11 +19,15 @@ import pandas as pd
 
 from app.forecast_ledger import (
     FORECAST_NAMESPACE,
+    ForecastStoreConfigurationError,
     ForecastIntegrityError,
     ForecastRecord,
+    LedgerDatabaseError,
+    LedgerTransientError,
     SQLiteForecastStore,
     canonical_feature_schema_json,
     canonical_identity_json,
+    create_forecast_store,
     feature_schema_sha256,
     issue_forecast,
     sha256_file,
@@ -108,6 +113,41 @@ class ForecastLedgerTests(unittest.TestCase):
         publication_date = reference.astimezone(ict).date()
         end = datetime.combine(publication_date, time.min, ict).astimezone(timezone.utc)
         return publication_date, end - timedelta(days=30), end
+
+    def test_store_factory_defaults_to_sqlite_when_backend_is_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            store = create_forecast_store(self.database)
+        self.assertIsInstance(store, SQLiteForecastStore)
+        self.assertEqual(store.path, self.database)
+        self.assertFalse(store.read_only)
+
+    def test_store_factory_accepts_explicit_sqlite(self):
+        with patch.dict(os.environ, {"AIRAWARE_LEDGER_BACKEND": "sqlite"}, clear=True):
+            store = create_forecast_store(self.database)
+        self.assertIsInstance(store, SQLiteForecastStore)
+
+    def test_store_factory_unknown_backend_fails_closed(self):
+        with patch.dict(os.environ, {"AIRAWARE_LEDGER_BACKEND": "unknown"}, clear=True), patch(
+                "app.forecast_ledger.SQLiteForecastStore") as sqlite_store:
+            with self.assertRaisesRegex(ForecastStoreConfigurationError, "unsupported AIRAWARE_LEDGER_BACKEND='unknown'"):
+                create_forecast_store(self.database)
+        sqlite_store.assert_not_called()
+
+    def test_store_factory_passes_read_only_to_sqlite(self):
+        with patch.dict(os.environ, {"AIRAWARE_LEDGER_BACKEND": "sqlite"}, clear=True):
+            store = create_forecast_store(self.database, read_only=True)
+        self.assertIsInstance(store, SQLiteForecastStore)
+        self.assertTrue(store.read_only)
+        self.assertEqual(store.path, self.database)
+
+    def test_sqlite_store_translates_runtime_database_errors(self):
+        store = SQLiteForecastStore(self.database)
+        with patch.object(store, "_connect", side_effect=sqlite3.OperationalError("unable to open database file")):
+            with self.assertRaises(LedgerDatabaseError):
+                store.latest()
+        with patch.object(store, "_connect", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(LedgerTransientError):
+                store.latest()
 
 
     def test_canonical_identity_and_uuid_are_exact_and_unicode_normalized(self):
