@@ -15,7 +15,13 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from app.forecast_ledger import ForecastIntegrityError, ForecastRecord, LedgerDatabaseError, SQLiteForecastStore
+from app.forecast_ledger import (
+    ForecastIntegrityError,
+    ForecastRecord,
+    LedgerDatabaseError,
+    SCHEMA_VERSION,
+    SQLiteForecastStore,
+)
 from app.ground_truth_reconciler import (
     ACQUISITION_NAMESPACE,
     RECONCILIATION_NAMESPACE,
@@ -57,7 +63,7 @@ class ReconciliationTests(unittest.TestCase):
         store = SQLiteForecastStore(self.database)
         store.initialize()
         with store._connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions"} <= tables)
@@ -78,7 +84,7 @@ class ReconciliationTests(unittest.TestCase):
             before_row = connection.execute("SELECT * FROM forecasts").fetchone()
         store.initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("SELECT sql FROM sqlite_master WHERE name='forecasts'").fetchone()[0], before_sql)
             self.assertEqual(connection.execute("SELECT * FROM forecasts").fetchone(), before_row)
 
@@ -137,21 +143,34 @@ class ReconciliationTests(unittest.TestCase):
             SQLiteForecastStore(self.database).initialize()
         with sqlite3.connect(self.database) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
-            connection.execute("PRAGMA user_version=9")
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
         with self.assertRaisesRegex(RuntimeError, "unsupported schema version"):
             SQLiteForecastStore(self.database).initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION + 1)
 
     def test_v6_cursor_migration_rebuilds_legacy_incomplete_backfill(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
         with sqlite3.connect(self.database) as connection:
             connection.execute("DELETE FROM evaluation_cohort_cursors")
+            connection.execute("DROP TABLE monitoring_leases")
             connection.execute("PRAGMA user_version=6")
         store.initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
+    def test_v8_migration_adds_monitoring_lease_table(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP TABLE monitoring_leases")
+            connection.execute("PRAGMA user_version=8")
+        store.initialize()
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(monitoring_leases)")}
+        self.assertEqual(columns, {"lease_name", "owner_id", "expires_at", "acquired_at"})
 
     def test_v5_migration_rejects_missing_current_window_index(self):
         store = SQLiteForecastStore(self.database)

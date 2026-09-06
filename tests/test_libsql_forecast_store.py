@@ -143,6 +143,33 @@ class LibSQLForecastStoreTests(unittest.TestCase):
         self.store.validate_existing()
         with closing(self.store._connect()) as connection:
             self.assertEqual(self.store._remote_schema_versions(connection), (SCHEMA_VERSION,))
+            self.assertIn("monitoring_leases", self.store._remote_tables(connection))
+
+    def test_remote_v8_schema_migrates_to_monitoring_leases(self):
+        self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            connection.execute("DROP TABLE monitoring_leases")
+            connection.execute("DELETE FROM schema_migrations")
+            connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (8, "2026-01-01T00:00:00Z"))
+            connection.commit()
+        self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            self.assertEqual(self.store._remote_schema_versions(connection), (SCHEMA_VERSION,))
+            self.assertIn("monitoring_leases", self.store._remote_tables(connection))
+
+    def test_monitoring_lease_matches_sqlite_semantics(self):
+        self.store.initialize()
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        lease_name = "production-monitoring"
+        self.assertTrue(self.store.acquire_monitoring_lease(lease_name, "owner-a", now, 60))
+        self.assertFalse(self.store.acquire_monitoring_lease(lease_name, "owner-b", now, 60))
+        self.assertTrue(self.store.acquire_monitoring_lease(
+            lease_name, "owner-a", now + timedelta(seconds=10), 60))
+        self.assertTrue(self.store.acquire_monitoring_lease(
+            lease_name, "owner-b", now + timedelta(seconds=70), 60))
+        self.assertFalse(self.store.release_monitoring_lease(lease_name, "owner-a"))
+        self.assertTrue(self.store.release_monitoring_lease(lease_name, "owner-b"))
 
     def test_remote_schema_rejects_future_and_partial_versions(self):
         self.store.initialize()
@@ -366,6 +393,25 @@ class LibSQLForecastStoreIntegrationTests(unittest.TestCase):
             reader.initialize()
         with self.assertRaisesRegex(LedgerDatabaseError, "read-only"):
             reader.insert(_forecast("2" * 64, prediction_time=forecast.prediction_time + timedelta(hours=3)))
+
+    def test_real_turso_monitoring_lease_contract_on_existing_integration_database(self):
+        store = LibSQLForecastStore(TEST_TURSO_URL, TEST_TURSO_TOKEN)
+        store.initialize()
+        lease_name = f"stage3-monitoring-lease-{uuid.uuid4()}"
+        now = datetime(2026, 1, 4, tzinfo=UTC)
+        try:
+            self.assertTrue(store.acquire_monitoring_lease(lease_name, "owner-a", now, 60))
+            self.assertFalse(store.acquire_monitoring_lease(lease_name, "owner-b", now, 60))
+            self.assertTrue(store.acquire_monitoring_lease(
+                lease_name, "owner-b", now + timedelta(seconds=60), 60))
+            self.assertFalse(store.release_monitoring_lease(lease_name, "owner-a"))
+            self.assertTrue(store.release_monitoring_lease(lease_name, "owner-b"))
+            self.assertTrue(store.acquire_monitoring_lease(
+                lease_name, "owner-a", now + timedelta(seconds=61), 60))
+        finally:
+            with closing(store._connect()) as connection:
+                connection.execute("DELETE FROM monitoring_leases WHERE lease_name=?", (lease_name,))
+                connection.commit()
 
     @unittest.skipUnless(TEST_TURSO_READER_TOKEN,
         "real Turso reader token unavailable; server-side read-only authorization untested")

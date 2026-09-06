@@ -8,7 +8,13 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from app.forecast_ledger import EvaluationRecord, ForecastIntegrityError, ForecastRecord, SQLiteForecastStore
+from app.forecast_ledger import (
+    EvaluationRecord,
+    ForecastIntegrityError,
+    ForecastRecord,
+    SCHEMA_VERSION,
+    SQLiteForecastStore,
+)
 from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 
 
@@ -59,7 +65,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
             before = connection.execute("SELECT * FROM forecasts").fetchone()
         store.initialize()
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("SELECT * FROM forecasts").fetchone(), before)
         failed = Path(self.directory.name) / "failed.sqlite3"
         failed_store = SQLiteForecastStore(failed)
@@ -106,10 +112,11 @@ class EvaluationPersistenceTests(unittest.TestCase):
         with sqlite3.connect(store.path) as connection:
             connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("DROP TABLE consumer_performance_publications")
+            connection.execute("DROP TABLE monitoring_leases")
             connection.execute("PRAGMA user_version=7")
         store.initialize()
         with sqlite3.connect(store.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='consumer_performance_current_idx'").fetchone())
             foreign = {(row[3], row[2], row[4]) for row in connection.execute("PRAGMA foreign_key_list(consumer_performance_publications)")}
             self.assertEqual(foreign, {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")})
@@ -195,7 +202,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
     def test_fresh_schema_and_materialization_are_immutable_and_idempotent(self):
         store = self._settled_store()
         with store._connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_rows'").fetchone())
         first = store.materialize_evaluation(self.forecast.forecast_id)
         self.assertEqual((first.status, first.record.observed_pm25, first.record.model_error, first.record.persistence_error),

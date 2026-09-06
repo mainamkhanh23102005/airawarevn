@@ -21,7 +21,7 @@ FORECAST_NAMESPACE = uuid.UUID("e60f879b-90cf-51a4-8936-aad3c962371c")
 EVALUATION_NAMESPACE = uuid.UUID("1e772429-52c1-5f08-a957-88d6a5f5abbd")
 EVALUATION_RUN_NAMESPACE = uuid.UUID("3c03496f-c34f-5b71-a62a-3a3b6430c613")
 CONSUMER_PUBLICATION_NAMESPACE = uuid.UUID("16ca2b67-725b-52f8-9a45-9c085fd6307d")
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -445,6 +445,8 @@ class _LibSQLConnection:
 class ForecastStore(Protocol):
     def validate_existing(self): ...
     def initialize(self): ...
+    def acquire_monitoring_lease(self, lease_name, owner_id, now, ttl_seconds): ...
+    def release_monitoring_lease(self, lease_name, owner_id): ...
     def insert(self, record): ...
     def get_by_id(self, forecast_id): ...
     def get_by_identity(self, record): ...
@@ -654,6 +656,19 @@ class SQLiteForecastStore:
         if foreign != {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")}:
             raise RuntimeError("unsupported schema")
 
+    def _create_m9_schema(self, connection):
+        connection.execute("""CREATE TABLE monitoring_leases (
+            lease_name TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL, acquired_at TEXT NOT NULL)""")
+
+    def _validate_m9_schema(self, connection):
+        info = list(connection.execute("PRAGMA table_info(monitoring_leases)"))
+        expected = {"lease_name", "owner_id", "expires_at", "acquired_at"}
+        if ({row[1] for row in info} != expected
+                or {row[1] for row in info if row[5]} != {"lease_name"}
+                or any(not row[3] for row in info)):
+            raise RuntimeError("unsupported schema")
+
     def _create_m2_schema(self, connection):
         connection.execute("""CREATE TABLE observation_acquisitions (
             acquisition_id TEXT PRIMARY KEY, sensor_id INTEGER NOT NULL,
@@ -689,7 +704,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-            required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications"}
+            required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications", "monitoring_leases"}
             if version != SCHEMA_VERSION or not required <= tables:
                 raise RuntimeError("unsupported schema")
             self._validate_forecasts_schema(connection)
@@ -698,6 +713,7 @@ class SQLiteForecastStore:
             self._validate_m4_schema(connection)
             self._validate_m6_schema(connection)
             self._validate_m8_schema(connection)
+            self._validate_m9_schema(connection)
 
     @_translate_sqlite_errors
     def initialize(self):
@@ -711,7 +727,7 @@ class SQLiteForecastStore:
                 raise RuntimeError("unsupported schema")
             if version == SCHEMA_VERSION:
                 self._validate_forecasts_schema(connection)
-                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications"}
+                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications", "monitoring_leases"}
                 if not required <= tables:
                     raise RuntimeError("unsupported schema")
                 self._validate_m2_schema(connection)
@@ -719,6 +735,7 @@ class SQLiteForecastStore:
                 self._validate_m4_schema(connection)
                 self._validate_m6_schema(connection)
                 self._validate_m8_schema(connection)
+                self._validate_m9_schema(connection)
                 return
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -748,6 +765,8 @@ class SQLiteForecastStore:
                     self._backfill_evaluation_cohort_cursors(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -764,6 +783,8 @@ class SQLiteForecastStore:
                     self._backfill_evaluation_cohort_cursors(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -777,6 +798,8 @@ class SQLiteForecastStore:
                     self._backfill_evaluation_cohort_cursors(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -788,6 +811,22 @@ class SQLiteForecastStore:
                     self._validate_m6_schema(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    connection.commit()
+                    return
+                elif version == 8:
+                    self._validate_forecasts_schema(connection)
+                    self._validate_m2_schema(connection)
+                    self._validate_m3_schema(connection)
+                    self._validate_m4_schema(connection)
+                    self._validate_m6_schema(connection)
+                    self._validate_m8_schema(connection)
+                    if "monitoring_leases" in tables:
+                        raise RuntimeError("unsupported schema")
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -797,9 +836,72 @@ class SQLiteForecastStore:
                 self._create_m5_schema(connection)
                 self._create_m6_schema(connection)
                 self._create_m8_schema(connection)
+                self._create_m9_schema(connection)
                 self._backfill_evaluation_cohort_cursors(connection)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    @_translate_sqlite_errors
+    def acquire_monitoring_lease(self, lease_name, owner_id, now, ttl_seconds):
+        if not isinstance(lease_name, str) or not lease_name:
+            raise ValueError("lease_name must be nonempty")
+        if not isinstance(owner_id, str) or not owner_id:
+            raise ValueError("owner_id must be nonempty")
+        now = _utc(now, "now")
+        if type(ttl_seconds) is not int or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive integer")
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT owner_id, expires_at, acquired_at FROM monitoring_leases WHERE lease_name=?",
+                    (lease_name,)).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO monitoring_leases(lease_name, owner_id, expires_at, acquired_at) VALUES (?,?,?,?)",
+                        (lease_name, owner_id, _timestamp(expires_at), _timestamp(now)))
+                    connection.commit()
+                    return True
+                if _parse_timestamp(row["expires_at"]) <= now:
+                    connection.execute(
+                        "UPDATE monitoring_leases SET owner_id=?, expires_at=?, acquired_at=? WHERE lease_name=?",
+                        (owner_id, _timestamp(expires_at), _timestamp(now), lease_name))
+                    connection.commit()
+                    return True
+                if row["owner_id"] == owner_id:
+                    connection.execute(
+                        "UPDATE monitoring_leases SET expires_at=? WHERE lease_name=? AND owner_id=?",
+                        (_timestamp(expires_at), lease_name, owner_id))
+                    connection.commit()
+                    return True
+                connection.commit()
+                return False
+            except Exception:
+                connection.rollback()
+                raise
+
+    @_translate_sqlite_errors
+    def release_monitoring_lease(self, lease_name, owner_id):
+        if not isinstance(lease_name, str) or not lease_name:
+            raise ValueError("lease_name must be nonempty")
+        if not isinstance(owner_id, str) or not owner_id:
+            raise ValueError("owner_id must be nonempty")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT owner_id FROM monitoring_leases WHERE lease_name=?", (lease_name,)).fetchone()
+                if row is None or row["owner_id"] != owner_id:
+                    connection.commit()
+                    return False
+                connection.execute(
+                    "DELETE FROM monitoring_leases WHERE lease_name=? AND owner_id=?", (lease_name, owner_id))
+                connection.commit()
+                return True
             except Exception:
                 connection.rollback()
                 raise
@@ -1516,17 +1618,19 @@ class LibSQLForecastStore(SQLiteForecastStore):
         return tuple(row[0] for row in connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version").fetchall())
 
-    def _validate_remote_schema(self, connection):
+    def _validate_remote_schema(self, connection, expected_version=SCHEMA_VERSION):
         required = {"schema_migrations", "forecasts", "observation_acquisitions", "forecast_reconciliations",
             "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors",
             "consumer_performance_publications"}
+        if expected_version >= 9:
+            required.add("monitoring_leases")
         tables = self._remote_tables(connection)
         if not required <= tables:
             raise RuntimeError("unsupported schema")
         versions = self._remote_schema_versions(connection)
         if versions and max(versions) > SCHEMA_VERSION:
             raise RuntimeError("unsupported schema version")
-        if versions != (SCHEMA_VERSION,):
+        if versions != (expected_version,):
             raise RuntimeError("unsupported schema")
         self._validate_forecasts_schema(connection)
         self._validate_m2_schema(connection)
@@ -1534,6 +1638,8 @@ class LibSQLForecastStore(SQLiteForecastStore):
         self._validate_m4_schema(connection)
         self._validate_m6_schema(connection)
         self._validate_m8_schema(connection)
+        if expected_version >= 9:
+            self._validate_m9_schema(connection)
 
     def validate_existing(self):
         with closing(self._connect()) as connection:
@@ -1547,6 +1653,25 @@ class LibSQLForecastStore(SQLiteForecastStore):
             if tables:
                 if "schema_migrations" not in tables:
                     raise RuntimeError("unsupported schema")
+                versions = self._remote_schema_versions(connection)
+                if versions == (SCHEMA_VERSION,):
+                    self._validate_remote_schema(connection)
+                    return
+                if versions != (8,) or "monitoring_leases" in tables:
+                    self._validate_remote_schema(connection)
+                    return
+                self._validate_remote_schema(connection, expected_version=8)
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    connection.execute("DELETE FROM schema_migrations WHERE version=?", (8,))
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
                 self._validate_remote_schema(connection)
                 return
             connection.execute("BEGIN IMMEDIATE")
@@ -1560,6 +1685,7 @@ class LibSQLForecastStore(SQLiteForecastStore):
                 self._create_m5_schema(connection)
                 self._create_m6_schema(connection)
                 self._create_m8_schema(connection)
+                self._create_m9_schema(connection)
                 connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
                 connection.commit()

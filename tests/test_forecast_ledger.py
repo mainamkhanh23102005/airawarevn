@@ -24,6 +24,7 @@ from app.forecast_ledger import (
     ForecastRecord,
     LedgerDatabaseError,
     LedgerTransientError,
+    SCHEMA_VERSION,
     SQLiteForecastStore,
     canonical_feature_schema_json,
     canonical_identity_json,
@@ -216,7 +217,7 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertEqual(result.status, "inserted")
         self.assertEqual(SQLiteForecastStore(self.database).latest(), self.record)
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_identical_insert_is_idempotent_but_conflict_never_overwrites(self):
         store = SQLiteForecastStore(self.database)
@@ -262,6 +263,69 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertEqual(store.count(), 1)
         self.assertEqual(statuses.count("inserted"), 1)
         self.assertEqual(statuses.count("already_exists"), 7)
+
+    def test_monitoring_lease_acquire_reacquire_expiry_takeover_and_release(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        lease_name = "production-monitoring"
+
+        self.assertTrue(store.acquire_monitoring_lease(lease_name, "owner-a", now, 60))
+        self.assertFalse(store.acquire_monitoring_lease(lease_name, "owner-b", now, 60))
+        self.assertTrue(store.acquire_monitoring_lease(
+            lease_name, "owner-a", now + timedelta(seconds=10), 60))
+        with store._connect() as connection:
+            row = connection.execute(
+                "SELECT owner_id, acquired_at, expires_at FROM monitoring_leases WHERE lease_name=?",
+                (lease_name,)).fetchone()
+        self.assertEqual(row["owner_id"], "owner-a")
+        self.assertEqual(row["acquired_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(row["expires_at"], "2026-01-01T00:01:10Z")
+
+        takeover = now + timedelta(seconds=70)
+        self.assertTrue(store.acquire_monitoring_lease(lease_name, "owner-b", takeover, 60))
+        self.assertFalse(store.release_monitoring_lease(lease_name, "owner-a"))
+        self.assertTrue(store.release_monitoring_lease(lease_name, "owner-b"))
+        self.assertTrue(store.acquire_monitoring_lease(
+            lease_name, "owner-a", takeover + timedelta(seconds=1), 60))
+
+    def test_monitoring_lease_validates_identity_time_and_ttl(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        aware = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for lease_name, owner_id in (("", "owner"), ("lease", ""), (None, "owner"), ("lease", None)):
+            with self.subTest(lease_name=lease_name, owner_id=owner_id), self.assertRaises(ValueError):
+                store.acquire_monitoring_lease(lease_name, owner_id, aware, 60)
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            store.acquire_monitoring_lease("lease", "owner", datetime(2026, 1, 1), 60)
+        for ttl in (0, -1, 1.5, True):
+            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
+                store.acquire_monitoring_lease("lease", "owner", aware, ttl)
+
+    def test_concurrent_monitoring_lease_acquisition_has_one_owner(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        barrier = threading.Barrier(8)
+        outcomes = []
+        errors = []
+
+        def acquire(index):
+            try:
+                barrier.wait()
+                outcomes.append(store.acquire_monitoring_lease(
+                    "production-monitoring", f"owner-{index}", now, 60))
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=acquire, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertFalse(errors)
+        self.assertEqual(outcomes.count(True), 1)
+        self.assertEqual(outcomes.count(False), 7)
 
     def test_changed_artifact_or_schema_creates_distinct_identity(self):
         one = self.record
