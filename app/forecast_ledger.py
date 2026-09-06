@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -317,6 +318,128 @@ def _translate_sqlite_errors(function):
         except sqlite3.Error as error:
             raise LedgerDatabaseError(str(error)) from error
     return wrapped
+
+
+def _raise_libsql_error(error):
+    message = str(error)
+    lowered = message.lower()
+    if "constraint failed" in lowered or "constraint violation" in lowered:
+        raise sqlite3.IntegrityError(message) from error
+    transient_markers = ("busy", "locked", "timeout", "temporarily unavailable", "try again", "conflict")
+    error_type = LedgerTransientError if any(marker in lowered for marker in transient_markers) else LedgerDatabaseError
+    raise error_type(message) from error
+
+
+class _LibSQLRow:
+    def __init__(self, columns, values):
+        self._columns = tuple(columns)
+        self._values = tuple(values)
+        self._index = {name: index for index, name in enumerate(self._columns)}
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._values[self._index[key]]
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def keys(self):
+        return self._columns
+
+
+class _LibSQLCursor:
+    def __init__(self, cursor, driver_error):
+        self._cursor = cursor
+        self._driver_error = driver_error
+        description = cursor.description or ()
+        self._columns = tuple(column[0] for column in description)
+
+    def _row(self, row):
+        return None if row is None else _LibSQLRow(self._columns, row)
+
+    def fetchone(self):
+        try:
+            return self._row(self._cursor.fetchone())
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def fetchall(self):
+        try:
+            return [self._row(row) for row in (self._cursor.fetchall() or [])]
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+
+class _LibSQLConnection:
+    def __init__(self, connection, driver_error, read_only=False):
+        self._connection = connection
+        self._driver_error = driver_error
+        self._read_only = read_only
+
+    def _guard_read_only(self, sql):
+        if not self._read_only:
+            return
+        statement = sql.lstrip().upper()
+        if statement.startswith("SELECT") or statement.startswith("EXPLAIN"):
+            return
+        if statement.startswith((
+                "PRAGMA TABLE_LIST",
+                "PRAGMA TABLE_INFO(",
+                "PRAGMA INDEX_LIST(",
+                "PRAGMA INDEX_INFO(",
+                "PRAGMA FOREIGN_KEY_LIST(",
+        )):
+            return
+        raise LedgerDatabaseError("libSQL forecast store is read-only")
+
+    def execute(self, sql, parameters=None):
+        self._guard_read_only(sql)
+        try:
+            cursor = self._connection.execute(sql) if parameters is None else self._connection.execute(sql, parameters)
+            return _LibSQLCursor(cursor, self._driver_error)
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def commit(self):
+        try:
+            return self._connection.commit()
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def rollback(self):
+        try:
+            return self._connection.rollback()
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def close(self):
+        try:
+            return self._connection.close()
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
 
 
 class ForecastStore(Protocol):
@@ -1354,12 +1477,131 @@ class SQLiteForecastStore:
             return connection.execute("SELECT COUNT(*) FROM observation_revisions").fetchone()[0]
 
 
+class LibSQLForecastStore(SQLiteForecastStore):
+    def __init__(self, database_url, auth_token, read_only=False):
+        self.database_url = database_url
+        self.auth_token = auth_token
+        self.read_only = read_only
+
+    @staticmethod
+    def _load_driver():
+        try:
+            return importlib.import_module("libsql")
+        except ImportError as error:
+            raise ForecastStoreConfigurationError(
+                "AIRAWARE_LEDGER_BACKEND='libsql' requires the libsql package"
+            ) from error
+
+    def _connect(self):
+        driver = self._load_driver()
+        try:
+            raw = driver.connect(
+                database=self.database_url,
+                auth_token=self.auth_token,
+                timeout=30,
+                isolation_level=None,
+            )
+            if not self.read_only:
+                raw.execute("PRAGMA foreign_keys=ON")
+        except (driver.Error, ValueError) as error:
+            _raise_libsql_error(error)
+        return _LibSQLConnection(raw, driver.Error, read_only=self.read_only)
+
+    def _remote_tables(self, connection):
+        rows = connection.execute("PRAGMA table_list").fetchall()
+        return {row["name"] for row in rows
+                if row["schema"] == "main" and row["type"] == "table" and not row["name"].startswith("sqlite_")}
+
+    def _remote_schema_versions(self, connection):
+        return tuple(row[0] for row in connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version").fetchall())
+
+    def _validate_remote_schema(self, connection):
+        required = {"schema_migrations", "forecasts", "observation_acquisitions", "forecast_reconciliations",
+            "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors",
+            "consumer_performance_publications"}
+        tables = self._remote_tables(connection)
+        if not required <= tables:
+            raise RuntimeError("unsupported schema")
+        versions = self._remote_schema_versions(connection)
+        if versions and max(versions) > SCHEMA_VERSION:
+            raise RuntimeError("unsupported schema version")
+        if versions != (SCHEMA_VERSION,):
+            raise RuntimeError("unsupported schema")
+        self._validate_forecasts_schema(connection)
+        self._validate_m2_schema(connection)
+        self._validate_m3_schema(connection)
+        self._validate_m4_schema(connection)
+        self._validate_m6_schema(connection)
+        self._validate_m8_schema(connection)
+
+    def validate_existing(self):
+        with closing(self._connect()) as connection:
+            self._validate_remote_schema(connection)
+
+    def initialize(self):
+        if self.read_only:
+            raise LedgerDatabaseError("libSQL forecast store is read-only")
+        with closing(self._connect()) as connection:
+            tables = self._remote_tables(connection)
+            if tables:
+                if "schema_migrations" not in tables:
+                    raise RuntimeError("unsupported schema")
+                self._validate_remote_schema(connection)
+                return
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("""CREATE TABLE schema_migrations (
+                    version INTEGER NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)""")
+                connection.execute(self._forecast_schema())
+                self._create_m2_schema(connection)
+                self._create_m3_schema(connection)
+                self._create_m4_schema(connection)
+                self._create_m5_schema(connection)
+                self._create_m6_schema(connection)
+                self._create_m8_schema(connection)
+                connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        self.validate_existing()
+
+    def latest(self):
+        with closing(self._connect()) as connection:
+            return self._row(connection.execute(
+                "SELECT * FROM forecasts ORDER BY issued_at DESC, forecast_id DESC LIMIT 1").fetchone())
+
+    def current_consumer_performance(self, model_version, model_artifact_sha256,
+                                     feature_schema_sha256, sensor_id,
+                                     evaluation_policy_version=1, forecast_horizon_hours=6):
+        with closing(self._connect()) as connection:
+            row = connection.execute("""SELECT * FROM consumer_performance_publications
+                WHERE model_version=? AND model_artifact_sha256=? AND feature_schema_sha256=?
+                AND sensor_id=? AND evaluation_policy_version=? AND forecast_horizon_hours=?
+                ORDER BY publication_date DESC, published_at DESC, publication_id DESC LIMIT 1""",
+                (model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                 evaluation_policy_version, forecast_horizon_hours)).fetchone()
+            return self._consumer_publication_row(row)
+
+
 def create_forecast_store(path, read_only=False):
     selected_backend = os.environ.get("AIRAWARE_LEDGER_BACKEND", "sqlite").strip().lower()
     if selected_backend == "sqlite":
         return SQLiteForecastStore(path, read_only=read_only)
+    if selected_backend == "libsql":
+        database_url = os.environ.get("AIRAWARE_TURSO_DATABASE_URL", "").strip()
+        auth_token = os.environ.get("AIRAWARE_TURSO_AUTH_TOKEN", "").strip()
+        missing = [name for name, value in (
+            ("AIRAWARE_TURSO_DATABASE_URL", database_url), ("AIRAWARE_TURSO_AUTH_TOKEN", auth_token)) if not value]
+        if missing:
+            raise ForecastStoreConfigurationError(
+                "libsql backend requires " + ", ".join(missing)
+            )
+        return LibSQLForecastStore(database_url, auth_token, read_only=read_only)
     raise ForecastStoreConfigurationError(
-        f"unsupported AIRAWARE_LEDGER_BACKEND={selected_backend!r}; supported backends: sqlite"
+        f"unsupported AIRAWARE_LEDGER_BACKEND={selected_backend!r}; supported backends: sqlite, libsql"
     )
 
 

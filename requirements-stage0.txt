@@ -1,6 +1,7 @@
 fastapi
 httpx
 joblib>=1.4
+libsql==0.1.11
 pandas
 scikit-learn>=1.5,<2
 tzdata
