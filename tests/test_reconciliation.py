@@ -9,13 +9,24 @@ import tempfile
 import threading
 import unittest
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from app.forecast_ledger import ForecastIntegrityError, ForecastRecord, SQLiteForecastStore
+import httpx
+
+from scripts import reconcile_ground_truth as cli
+
+from app.forecast_ledger import (
+    ForecastIntegrityError,
+    ForecastRecord,
+    LedgerDatabaseError,
+    SCHEMA_VERSION,
+    SQLiteForecastStore,
+)
 from app.ground_truth_reconciler import (
     ACQUISITION_NAMESPACE,
     RECONCILIATION_NAMESPACE,
@@ -56,8 +67,8 @@ class ReconciliationTests(unittest.TestCase):
     def test_fresh_database_has_exact_v2_tables_and_foreign_keys(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
-        with store._connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(store._connect()) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions"} <= tables)
@@ -65,7 +76,7 @@ class ReconciliationTests(unittest.TestCase):
     def _create_v1(self):
         store = SQLiteForecastStore(self.database)
         self.database.parent.mkdir(parents=True, exist_ok=True)
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             connection.execute(store._forecast_schema())
             connection.execute("PRAGMA user_version=1")
         return store
@@ -73,12 +84,12 @@ class ReconciliationTests(unittest.TestCase):
     def test_v1_migration_preserves_forecast_schema_and_values(self):
         store = self._create_v1()
         store.insert(self.forecast)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             before_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='forecasts'").fetchone()[0]
             before_row = connection.execute("SELECT * FROM forecasts").fetchone()
         store.initialize()
-        with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("SELECT sql FROM sqlite_master WHERE name='forecasts'").fetchone()[0], before_sql)
             self.assertEqual(connection.execute("SELECT * FROM forecasts").fetchone(), before_row)
 
@@ -91,7 +102,7 @@ class ReconciliationTests(unittest.TestCase):
         for index, statement in enumerate(corruptions):
             path = Path(self.directory.name) / f"schema-{index}.sqlite3"
             store = SQLiteForecastStore(path); store.initialize()
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 if index == 0:
                     connection.execute(statement)
                 elif index == 1:
@@ -114,7 +125,7 @@ class ReconciliationTests(unittest.TestCase):
         for index, (table, changes) in enumerate(replacements.items()):
             path = Path(self.directory.name) / f"pk-{index}.sqlite3"
             store = SQLiteForecastStore(path); store.initialize()
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
                 connection.execute("PRAGMA foreign_keys=OFF")
                 connection.execute(f"ALTER TABLE {table} RENAME TO old_{table}")
@@ -125,44 +136,59 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_partial_v2_fails_closed(self):
         store = SQLiteForecastStore(self.database); store.initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("DROP TABLE observation_revisions")
         with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
             store.initialize()
 
     def test_partial_v0_and_future_versions_fail_without_mutation(self):
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("CREATE TABLE stray(value TEXT)")
         with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
             SQLiteForecastStore(self.database).initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
-            connection.execute("PRAGMA user_version=9")
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
         with self.assertRaisesRegex(RuntimeError, "unsupported schema version"):
             SQLiteForecastStore(self.database).initialize()
-        with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION + 1)
 
     def test_v6_cursor_migration_rebuilds_legacy_incomplete_backfill(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("DELETE FROM evaluation_cohort_cursors")
+            connection.execute("DROP TABLE monitoring_leases")
+            connection.execute("DROP TABLE observation_raw_evidence")
             connection.execute("PRAGMA user_version=6")
         store.initialize()
-        with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
+    def test_v8_migration_adds_monitoring_lease_table(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TABLE monitoring_leases")
+            connection.execute("DROP TABLE observation_raw_evidence")
+            connection.execute("PRAGMA user_version=8")
+        store.initialize()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(monitoring_leases)")}
+        self.assertEqual(columns, {"lease_name", "owner_id", "expires_at", "acquired_at"})
 
     def test_v5_migration_rejects_missing_current_window_index(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("DROP INDEX evaluation_rows_current_window_idx")
             connection.execute("DROP TABLE evaluation_cohort_cursors")
             connection.execute("PRAGMA user_version=5")
         with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
             store.initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_cohort_cursors'").fetchone())
 
@@ -171,7 +197,7 @@ class ReconciliationTests(unittest.TestCase):
         with patch.object(store, "_create_m2_schema", side_effect=RuntimeError("boom")):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 store.initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
             self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name='observation_acquisitions'").fetchone())
 
@@ -405,14 +431,14 @@ class ReconciliationTests(unittest.TestCase):
         for thread in threads: thread.join()
         self.assertFalse(errors)
         self.assertEqual(store.count_revisions(), 1)
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             connection.execute("UPDATE observation_revisions SET raw_payload_sha256=?", ("0" * 64,))
         with self.assertRaises(ForecastIntegrityError):
             reconciler.reconcile(self.forecast, changed)
 
     def test_database_failure_returns_frozen_classification_without_partial_rows(self):
         store, reconciler = self._reconciler()
-        with patch.object(store, "settle", side_effect=sqlite3.OperationalError("boom")):
+        with patch.object(store, "settle", side_effect=LedgerDatabaseError("boom")):
             result = reconciler.reconcile(self.forecast, self._batch())
         self.assertEqual((result.status, result.reason_code), ("failed", "database_error"))
         self.assertEqual(store.count_acquisitions(), 0)
@@ -425,7 +451,7 @@ class ReconciliationTests(unittest.TestCase):
         changed = self._batch(value=Decimal("13"), retrieved_at=self.forecast.target_interval_end + timedelta(hours=3))
         changed = AcquisitionBatch.create(**{**changed.__dict__, "acquisition_id": None, "raw_payload_sha256": "d" * 64})
         self.assertEqual(reconciler.reconcile(self.forecast, changed).status, "revision_detected")
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             reconciliation = connection.execute("SELECT * FROM forecast_reconciliations").fetchone()
             revision = connection.execute("SELECT * FROM observation_revisions").fetchone()
         self.assertEqual(reconciliation["reconciliation_id"], "74de0370-015b-514d-bf9b-33cdf98816b0")
@@ -443,7 +469,7 @@ class ReconciliationTests(unittest.TestCase):
                 for record_id in ("z", None, "a")]
         store, reconciler = self._reconciler()
         self.assertEqual(reconciler.reconcile(self.forecast, self._batch(records=list(reversed(rows)))).status, "reconciled")
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             stored = connection.execute("SELECT source_record_ids_json, normalized_candidate_sha256 FROM forecast_reconciliations").fetchone()
         self.assertEqual(stored["source_record_ids_json"], '[null,"a","z"]')
         self.assertEqual(stored["normalized_candidate_sha256"], normalized_sha256(rows))
@@ -553,7 +579,7 @@ class ReconciliationTests(unittest.TestCase):
     def test_settlement_database_failure_rolls_back_acquisition_transaction(self):
         store, reconciler = self._reconciler()
         before = (store.count_acquisitions(), store.count_revisions(), store.get_reconciliation(self.forecast.forecast_id))
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             connection.execute("CREATE TRIGGER fail_reconciliation BEFORE INSERT ON forecast_reconciliations BEGIN SELECT RAISE(ABORT, 'boom'); END")
         result = reconciler.reconcile(self.forecast, self._batch())
         self.assertEqual((result.status, result.reason_code), ("failed", "database_error"))
@@ -587,7 +613,7 @@ class ReconciliationTests(unittest.TestCase):
         source = Source(); source._batch = self._batch()
         result = GroundTruthReconciler(store, now=lambda: now, source=source).run()
         self.assertEqual(result.results[0].status, "reconciled")
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             self.assertEqual(connection.execute("SELECT reconciled_at FROM forecast_reconciliations").fetchone()[0],
                 (now.replace(microsecond=0)).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
@@ -620,6 +646,88 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(store.count_acquisitions(), 0)
         self.assertIsNone(store.get_reconciliation(self.forecast.forecast_id))
         self.assertEqual(store.count_revisions(), 0)
+
+    def _openaq_payload(self, forecast):
+        return (json.dumps({"results": [{"id": 1, "sensor_id": forecast.sensor_id,
+            "value": 12.5, "parameter": {"units": "µg/m³"},
+            "period": {"datetimeFrom": {"utc": forecast.target_interval_start.isoformat()},
+                "datetimeTo": {"utc": forecast.target_interval_end.isoformat()}}}]},
+            ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+    def test_deployed_run_commits_exact_raw_evidence_before_dependent_metadata(self):
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                database = Path(self.directory.name) / f"deployed-{pending}.sqlite3"
+                store = SQLiteForecastStore(database); store.initialize(); store.insert(self.forecast)
+                payload = b'{ "results": [] }\n' if pending else self._openaq_payload(self.forecast)
+                digest = hashlib.sha256(payload).hexdigest()
+                method = "persist_acquisition" if pending else "settle"
+                original = getattr(SQLiteForecastStore, method)
+                observed = []
+
+                def check_evidence(instance, *args, **kwargs):
+                    with closing(sqlite3.connect(database)) as connection:
+                        self.assertEqual(connection.execute(
+                            "SELECT raw_payload_sha256, raw_payload FROM observation_raw_evidence"
+                        ).fetchall(), [(digest, payload)])
+                        for table in ("observation_acquisitions", "forecast_reconciliations", "observation_revisions"):
+                            self.assertEqual(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+                    observed.append(True)
+                    return original(instance, *args, **kwargs)
+
+                client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=payload)))
+                with patch.object(cli.httpx, "Client", return_value=client), patch.object(
+                    SQLiteForecastStore, method, autospec=True, side_effect=check_evidence
+                ):
+                    result = cli.run_reconciliation(database, Path(self.directory.name) / f"raw-{pending}",
+                        "test-key", now=lambda: self.forecast.target_interval_end + timedelta(hours=2))
+                self.assertEqual(observed, [True])
+                self.assertEqual([(item.status, item.reason_code) for item in result.results],
+                    [("pending", "not_available") if pending else ("reconciled", None)])
+                with closing(sqlite3.connect(database)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT raw_payload_sha256 FROM observation_acquisitions"
+                    ).fetchall(), [(digest,)])
+                    self.assertEqual(connection.execute(
+                        "SELECT raw_payload_sha256 FROM forecast_reconciliations"
+                    ).fetchall(), [] if pending else [(digest,)])
+                    self.assertEqual(connection.execute(
+                        "SELECT raw_payload FROM observation_raw_evidence WHERE raw_payload_sha256=?", (digest,)
+                    ).fetchone()[0], payload)
+
+    def test_deployed_run_evidence_failure_has_no_dependent_metadata_and_continues(self):
+        store = SQLiteForecastStore(self.database); store.initialize(); store.insert(self.forecast)
+        second = ForecastRecord.create(**{**self.forecast.as_dict(), "forecast_id": None, "sensor_id": 10})
+        store.insert(second)
+        payloads = {forecast.sensor_id: self._openaq_payload(forecast) for forecast in (self.forecast, second)}
+        failed_digest = hashlib.sha256(payloads[9]).hexdigest()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(f"""CREATE TRIGGER fail_raw_evidence BEFORE INSERT ON observation_raw_evidence
+                WHEN NEW.raw_payload_sha256 = '{failed_digest}'
+                BEGIN SELECT RAISE(ABORT, 'evidence unavailable'); END""")
+        requests = []
+
+        def respond(request):
+            sensor_id = int(request.url.path.split("/")[-2])
+            requests.append(sensor_id)
+            return httpx.Response(200, content=payloads[sensor_id])
+
+        client = httpx.Client(transport=httpx.MockTransport(respond))
+        with patch.object(cli.httpx, "Client", return_value=client):
+            result = cli.run_reconciliation(self.database, Path(self.directory.name) / "raw", "test-key",
+                now=lambda: self.forecast.target_interval_end + timedelta(hours=2))
+        self.assertEqual(requests, [9, 10])
+        self.assertEqual({item.forecast_id: (item.status, item.reason_code) for item in result.results}, {
+            self.forecast.forecast_id: ("failed", "database_error"), second.forecast_id: ("reconciled", None)})
+        self.assertEqual(result.counts, {"failed": 1, "reconciled": 1})
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT raw_payload_sha256, raw_payload FROM observation_raw_evidence"
+            ).fetchall(), [(hashlib.sha256(payloads[10]).hexdigest(), payloads[10])])
+            self.assertEqual(connection.execute("SELECT sensor_id FROM observation_acquisitions").fetchall(), [(10,)])
+            self.assertEqual(connection.execute("SELECT forecast_id FROM forecast_reconciliations").fetchall(),
+                [(second.forecast_id,)])
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM observation_revisions").fetchone()[0], 0)
 
     def test_cli_is_thin_machine_readable_and_has_no_delay_override(self):
         root = Path(__file__).resolve().parents[1]

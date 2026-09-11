@@ -4,7 +4,6 @@ import math
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +22,7 @@ from app.evaluation_monitor import materialize_available_evaluations
 from app.main import create_app
 from app.forecast_ledger import (
     ForecastRecord,
+    LedgerDatabaseError,
     SQLiteForecastStore,
     feature_schema_sha256,
     sha256_file,
@@ -990,9 +990,9 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
         self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast source is unavailable."}))
         self.assertNotIn(str(database), response.text)
 
-    def test_enabled_sqlite_error_is_sanitized(self):
+    def test_enabled_ledger_database_error_is_sanitized(self):
         database = Path(self.directory.name) / "private-secret-ledger.sqlite3"
-        with patch("app.forecast_ledger.SQLiteForecastStore.latest", side_effect=sqlite3.OperationalError(f"SQL at {database}")):
+        with patch("app.forecast_ledger.SQLiteForecastStore.latest", side_effect=LedgerDatabaseError(f"SQL at {database}")):
             with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
                 response = client.get("/forecast/current")
         self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast source is unavailable."}))
@@ -1202,7 +1202,7 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
         with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
             for invalid in cases:
                 self.assertEqual(client.get("/reporting/forecast-performance", params=invalid).status_code, 422)
-        with patch("app.forecast_ledger.SQLiteForecastStore.find_evaluation_run_snapshot", side_effect=sqlite3.OperationalError(f"SQL {database}")):
+        with patch("app.forecast_ledger.SQLiteForecastStore.find_evaluation_run_snapshot", side_effect=LedgerDatabaseError(f"SQL {database}")):
             with TestClient(create_app(self.artifact_path, forecast_ledger_path=database)) as client:
                 response = client.get("/reporting/forecast-performance", params=params)
         self.assertEqual((response.status_code, response.json()), (503, {"detail": "Forecast performance reporting is unavailable."}))

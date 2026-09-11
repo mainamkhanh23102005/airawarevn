@@ -1,12 +1,15 @@
 import hashlib
+import importlib
 import json
 import math
+import os
 import sqlite3
 import unicodedata
 import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass, fields
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -18,7 +21,8 @@ FORECAST_NAMESPACE = uuid.UUID("e60f879b-90cf-51a4-8936-aad3c962371c")
 EVALUATION_NAMESPACE = uuid.UUID("1e772429-52c1-5f08-a957-88d6a5f5abbd")
 EVALUATION_RUN_NAMESPACE = uuid.UUID("3c03496f-c34f-5b71-a62a-3a3b6430c613")
 CONSUMER_PUBLICATION_NAMESPACE = uuid.UUID("16ca2b67-725b-52f8-9a45-9c085fd6307d")
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
+MAX_RAW_EVIDENCE_BYTES = 2 * 1024 * 1024
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -26,6 +30,18 @@ IDENTITY_FIELDS = (
 
 
 class ForecastIntegrityError(Exception):
+    pass
+
+
+class LedgerDatabaseError(Exception):
+    pass
+
+
+class LedgerTransientError(LedgerDatabaseError):
+    pass
+
+
+class ForecastStoreConfigurationError(ValueError):
     pass
 
 
@@ -291,10 +307,172 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def _translate_sqlite_errors(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            error_type = LedgerTransientError if "locked" in message or "busy" in message else LedgerDatabaseError
+            raise error_type(str(error)) from error
+        except sqlite3.Error as error:
+            raise LedgerDatabaseError(str(error)) from error
+    return wrapped
+
+
+def _raise_libsql_error(error):
+    message = str(error)
+    lowered = message.lower()
+    if "constraint failed" in lowered or "constraint violation" in lowered:
+        raise sqlite3.IntegrityError(message) from error
+    transient_markers = ("busy", "locked", "timeout", "temporarily unavailable", "try again", "conflict")
+    error_type = LedgerTransientError if any(marker in lowered for marker in transient_markers) else LedgerDatabaseError
+    raise error_type(message) from error
+
+
+class _LibSQLRow:
+    def __init__(self, columns, values):
+        self._columns = tuple(columns)
+        self._values = tuple(values)
+        self._index = {name: index for index, name in enumerate(self._columns)}
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._values[self._index[key]]
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def keys(self):
+        return self._columns
+
+
+class _LibSQLCursor:
+    def __init__(self, cursor, driver_error):
+        self._cursor = cursor
+        self._driver_error = driver_error
+        description = cursor.description or ()
+        self._columns = tuple(column[0] for column in description)
+
+    def _row(self, row):
+        return None if row is None else _LibSQLRow(self._columns, row)
+
+    def fetchone(self):
+        try:
+            return self._row(self._cursor.fetchone())
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def fetchall(self):
+        try:
+            return [self._row(row) for row in (self._cursor.fetchall() or [])]
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+
+class _LibSQLConnection:
+    def __init__(self, connection, driver_error, read_only=False):
+        self._connection = connection
+        self._driver_error = driver_error
+        self._read_only = read_only
+
+    def _guard_read_only(self, sql):
+        if not self._read_only:
+            return
+        statement = sql.lstrip().upper()
+        if statement.startswith("SELECT") or statement.startswith("EXPLAIN"):
+            return
+        if statement.startswith((
+                "PRAGMA TABLE_LIST",
+                "PRAGMA TABLE_INFO(",
+                "PRAGMA INDEX_LIST(",
+                "PRAGMA INDEX_INFO(",
+                "PRAGMA FOREIGN_KEY_LIST(",
+        )):
+            return
+        raise LedgerDatabaseError("libSQL forecast store is read-only")
+
+    def execute(self, sql, parameters=None):
+        self._guard_read_only(sql)
+        try:
+            cursor = self._connection.execute(sql) if parameters is None else self._connection.execute(sql, parameters)
+            return _LibSQLCursor(cursor, self._driver_error)
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def commit(self):
+        try:
+            return self._connection.commit()
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def rollback(self):
+        try:
+            return self._connection.rollback()
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def close(self):
+        try:
+            return self._connection.close()
+        except (self._driver_error, ValueError) as error:
+            _raise_libsql_error(error)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+
 class ForecastStore(Protocol):
+    def validate_existing(self): ...
     def initialize(self): ...
+    def acquire_monitoring_lease(self, lease_name, owner_id, now, ttl_seconds): ...
+    def release_monitoring_lease(self, lease_name, owner_id): ...
     def insert(self, record): ...
+    def get_by_id(self, forecast_id): ...
+    def get_by_identity(self, record): ...
     def latest(self): ...
+    def eligible_forecasts(self, now, delay_minutes, limit=None): ...
+    def forecasts_for_targets(self, targets): ...
+    def insert_raw_evidence(self, raw_payload_sha256, raw_payload): ...
+    def persist_acquisition(self, batch): ...
+    def settle(self, forecast, batch, candidates, reconciled_at, policy): ...
+    def materialize_evaluation(self, forecast_id, evaluated_at=None): ...
+    def pending_evaluation_forecast_ids(self, limit=None): ...
+    def pending_evaluation_snapshot_forecast_ids(self, limit=None): ...
+    def pending_evaluation_snapshot_windows(self, limit=None): ...
+    def create_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                       target_interval_end_start, target_interval_end_end, created_at,
+                                       evaluation_policy_version=1): ...
+    def find_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                     target_interval_end_start, target_interval_end_end,
+                                     evaluation_policy_version=1): ...
+    def publish_consumer_performance(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                     reference_time, published_at=None, evaluation_policy_version=1,
+                                     forecast_horizon_hours=6, minimum_verified_count=48): ...
+    def current_consumer_performance(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                                     evaluation_policy_version=1, forecast_horizon_hours=6): ...
+    def get_evaluation(self, forecast_id): ...
 
 
 class SQLiteForecastStore:
@@ -480,6 +658,75 @@ class SQLiteForecastStore:
         if foreign != {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")}:
             raise RuntimeError("unsupported schema")
 
+    def _create_m10_schema(self, connection):
+        connection.execute(f"""CREATE TABLE observation_raw_evidence (
+            raw_payload_sha256 TEXT NOT NULL PRIMARY KEY
+                CHECK(length(raw_payload_sha256)=64 AND raw_payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+            raw_payload BLOB NOT NULL CHECK(typeof(raw_payload)='blob' AND length(raw_payload)<={MAX_RAW_EVIDENCE_BYTES}))""")
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            connection.execute(self._raw_evidence_trigger(operation))
+
+    @staticmethod
+    def _raw_evidence_trigger(operation):
+        condition = ("WHEN EXISTS (SELECT 1 FROM observation_raw_evidence "
+            "WHERE raw_payload_sha256=NEW.raw_payload_sha256 OR rowid=NEW.rowid)") if operation == "INSERT" else ""
+        return f"""CREATE TRIGGER observation_raw_evidence_no_{operation.lower()}
+            BEFORE {operation} ON observation_raw_evidence
+            {condition}
+            BEGIN SELECT RAISE(ABORT, 'raw evidence is append-only'); END"""
+
+    def _validate_m10_schema(self, connection):
+        info = list(connection.execute("PRAGMA table_info(observation_raw_evidence)"))
+        schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='observation_raw_evidence'").fetchone()
+        normalized_schema = "" if schema is None else "".join(schema[0].lower().split())
+        required_checks = ("check(length(raw_payload_sha256)=64andraw_payload_sha256notglob'*[^0-9a-f]*')",
+            "check(typeof(raw_payload)='blob'andlength(raw_payload)<=2097152)")
+        if ({row[1] for row in info} != {"raw_payload_sha256", "raw_payload"}
+                or {row[1] for row in info if row[5]} != {"raw_payload_sha256"}
+                or {row[1]: row[2].upper() for row in info} != {"raw_payload_sha256": "TEXT", "raw_payload": "BLOB"}
+                or any(not row[3] for row in info)
+                or any(check not in normalized_schema for check in required_checks)):
+            raise RuntimeError("unsupported schema")
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (f"observation_raw_evidence_no_{operation.lower()}",)).fetchone()
+            if row is None or " ".join(row[0].split()) != " ".join(self._raw_evidence_trigger(operation).split()):
+                raise RuntimeError("unsupported schema")
+
+    @_translate_sqlite_errors
+    def insert_raw_evidence(self, raw_payload_sha256, raw_payload):
+        _hash(raw_payload_sha256, "raw_payload_sha256")
+        if (not isinstance(raw_payload, bytes) or len(raw_payload) > MAX_RAW_EVIDENCE_BYTES
+                or hashlib.sha256(raw_payload).hexdigest() != raw_payload_sha256):
+            raise ValueError("invalid raw evidence")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute("SELECT raw_payload FROM observation_raw_evidence WHERE raw_payload_sha256=?",
+                    (raw_payload_sha256,)).fetchone()
+                if row is None:
+                    connection.execute("INSERT INTO observation_raw_evidence VALUES (?, ?)",
+                        (raw_payload_sha256, raw_payload))
+                elif bytes(row[0]) != raw_payload:
+                    raise ForecastIntegrityError("raw evidence hash collision")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    def _create_m9_schema(self, connection):
+        connection.execute("""CREATE TABLE monitoring_leases (
+            lease_name TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL, acquired_at TEXT NOT NULL)""")
+
+    def _validate_m9_schema(self, connection):
+        info = list(connection.execute("PRAGMA table_info(monitoring_leases)"))
+        expected = {"lease_name", "owner_id", "expires_at", "acquired_at"}
+        if ({row[1] for row in info} != expected
+                or {row[1] for row in info if row[5]} != {"lease_name"}
+                or any(not row[3] for row in info)):
+            raise RuntimeError("unsupported schema")
+
     def _create_m2_schema(self, connection):
         connection.execute("""CREATE TABLE observation_acquisitions (
             acquisition_id TEXT PRIMARY KEY, sensor_id INTEGER NOT NULL,
@@ -510,11 +757,12 @@ class SQLiteForecastStore:
             FOREIGN KEY(reconciliation_id) REFERENCES forecast_reconciliations(reconciliation_id),
             FOREIGN KEY(acquisition_id) REFERENCES observation_acquisitions(acquisition_id))""")
 
+    @_translate_sqlite_errors
     def validate_existing(self):
         with closing(self._connect()) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-            required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications"}
+            required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications", "monitoring_leases"}
             if version != SCHEMA_VERSION or not required <= tables:
                 raise RuntimeError("unsupported schema")
             self._validate_forecasts_schema(connection)
@@ -523,10 +771,14 @@ class SQLiteForecastStore:
             self._validate_m4_schema(connection)
             self._validate_m6_schema(connection)
             self._validate_m8_schema(connection)
+            self._validate_m9_schema(connection)
+            self._validate_m10_schema(connection)
 
+    @_translate_sqlite_errors
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if version > SCHEMA_VERSION:
@@ -535,7 +787,7 @@ class SQLiteForecastStore:
                 raise RuntimeError("unsupported schema")
             if version == SCHEMA_VERSION:
                 self._validate_forecasts_schema(connection)
-                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications"}
+                required = {"forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors", "consumer_performance_publications", "monitoring_leases"}
                 if not required <= tables:
                     raise RuntimeError("unsupported schema")
                 self._validate_m2_schema(connection)
@@ -543,8 +795,10 @@ class SQLiteForecastStore:
                 self._validate_m4_schema(connection)
                 self._validate_m6_schema(connection)
                 self._validate_m8_schema(connection)
+                self._validate_m9_schema(connection)
+                self._validate_m10_schema(connection)
+                connection.commit()
                 return
-            connection.execute("BEGIN IMMEDIATE")
             try:
                 if version == 0:
                     connection.execute(self._forecast_schema())
@@ -572,6 +826,9 @@ class SQLiteForecastStore:
                     self._backfill_evaluation_cohort_cursors(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -588,6 +845,9 @@ class SQLiteForecastStore:
                     self._backfill_evaluation_cohort_cursors(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -601,6 +861,9 @@ class SQLiteForecastStore:
                     self._backfill_evaluation_cohort_cursors(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -612,6 +875,36 @@ class SQLiteForecastStore:
                     self._validate_m6_schema(connection)
                     self._create_m8_schema(connection)
                     self._validate_m8_schema(connection)
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
+                    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    connection.commit()
+                    return
+                elif version == 8:
+                    self._validate_forecasts_schema(connection)
+                    self._validate_m2_schema(connection)
+                    self._validate_m3_schema(connection)
+                    self._validate_m4_schema(connection)
+                    self._validate_m6_schema(connection)
+                    self._validate_m8_schema(connection)
+                    if "monitoring_leases" in tables:
+                        raise RuntimeError("unsupported schema")
+                    self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
+                    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    connection.commit()
+                    return
+                elif version == 9:
+                    self._validate_forecasts_schema(connection)
+                    self._validate_m2_schema(connection)
+                    self._validate_m3_schema(connection)
+                    self._validate_m4_schema(connection)
+                    self._validate_m6_schema(connection)
+                    self._validate_m8_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -621,9 +914,73 @@ class SQLiteForecastStore:
                 self._create_m5_schema(connection)
                 self._create_m6_schema(connection)
                 self._create_m8_schema(connection)
+                self._create_m9_schema(connection)
                 self._backfill_evaluation_cohort_cursors(connection)
+                self._create_m10_schema(connection)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    @_translate_sqlite_errors
+    def acquire_monitoring_lease(self, lease_name, owner_id, now, ttl_seconds):
+        if not isinstance(lease_name, str) or not lease_name:
+            raise ValueError("lease_name must be nonempty")
+        if not isinstance(owner_id, str) or not owner_id:
+            raise ValueError("owner_id must be nonempty")
+        now = _utc(now, "now")
+        if type(ttl_seconds) is not int or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive integer")
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT owner_id, expires_at, acquired_at FROM monitoring_leases WHERE lease_name=?",
+                    (lease_name,)).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO monitoring_leases(lease_name, owner_id, expires_at, acquired_at) VALUES (?,?,?,?)",
+                        (lease_name, owner_id, _timestamp(expires_at), _timestamp(now)))
+                    connection.commit()
+                    return True
+                if _parse_timestamp(row["expires_at"]) <= now:
+                    connection.execute(
+                        "UPDATE monitoring_leases SET owner_id=?, expires_at=?, acquired_at=? WHERE lease_name=?",
+                        (owner_id, _timestamp(expires_at), _timestamp(now), lease_name))
+                    connection.commit()
+                    return True
+                if row["owner_id"] == owner_id:
+                    connection.execute(
+                        "UPDATE monitoring_leases SET expires_at=? WHERE lease_name=? AND owner_id=?",
+                        (_timestamp(expires_at), lease_name, owner_id))
+                    connection.commit()
+                    return True
+                connection.commit()
+                return False
+            except Exception:
+                connection.rollback()
+                raise
+
+    @_translate_sqlite_errors
+    def release_monitoring_lease(self, lease_name, owner_id):
+        if not isinstance(lease_name, str) or not lease_name:
+            raise ValueError("lease_name must be nonempty")
+        if not isinstance(owner_id, str) or not owner_id:
+            raise ValueError("owner_id must be nonempty")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT owner_id FROM monitoring_leases WHERE lease_name=?", (lease_name,)).fetchone()
+                if row is None or row["owner_id"] != owner_id:
+                    connection.commit()
+                    return False
+                connection.execute(
+                    "DELETE FROM monitoring_leases WHERE lease_name=? AND owner_id=?", (lease_name, owner_id))
+                connection.commit()
+                return True
             except Exception:
                 connection.rollback()
                 raise
@@ -634,6 +991,7 @@ class SQLiteForecastStore:
     def _values(self, record):
         return tuple(_timestamp(value) if isinstance(value, datetime) else value for value in asdict(record).values())
 
+    @_translate_sqlite_errors
     def insert(self, record):
         expected_id = str(uuid.uuid5(FORECAST_NAMESPACE, canonical_identity_json(record)))
         if record.forecast_id != expected_id:
@@ -666,18 +1024,22 @@ class SQLiteForecastStore:
         values = tuple(_timestamp(getattr(record, name)) if isinstance(getattr(record, name), datetime) else getattr(record, name) for name in IDENTITY_FIELDS)
         return self._row(connection.execute(f"SELECT * FROM forecasts WHERE {where}", values).fetchone())
 
+    @_translate_sqlite_errors
     def get_by_id(self, forecast_id):
         with closing(self._connect()) as connection:
             return self._row(connection.execute("SELECT * FROM forecasts WHERE forecast_id=?", (forecast_id,)).fetchone())
 
+    @_translate_sqlite_errors
     def get_by_identity(self, record):
         with closing(self._connect()) as connection:
             return self._get_by_identity_connection(connection, record)
 
+    @_translate_sqlite_errors
     def latest(self):
         with closing(self._connect()) as connection:
             return self._row(connection.execute("SELECT * FROM forecasts ORDER BY issued_at DESC, rowid DESC LIMIT 1").fetchone())
 
+    @_translate_sqlite_errors
     def eligible_forecasts(self, now, delay_minutes, limit=None):
         cutoff = _timestamp(_utc(now, "now") - timedelta(minutes=delay_minutes))
         sql = """SELECT forecasts.* FROM forecasts
@@ -691,6 +1053,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return [self._row(row) for row in connection.execute(sql, parameters)]
 
+    @_translate_sqlite_errors
     def forecasts_for_targets(self, targets):
         if not targets:
             return []
@@ -724,12 +1087,14 @@ class SQLiteForecastStore:
         if existing is None or tuple(existing) != values:
             raise ForecastIntegrityError("immutable acquisition conflict")
 
+    @_translate_sqlite_errors
     def persist_acquisition(self, batch):
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._persist_acquisition_connection(connection, batch)
             connection.commit()
 
+    @_translate_sqlite_errors
     def settle(self, forecast, batch, candidates, reconciled_at, policy):
         from app.ground_truth_reconciler import ReconcileResult, _canonical_json, _identity, normalized_sha256, RECONCILIATION_NAMESPACE, REVISION_NAMESPACE
         value_text = candidates[0][1]
@@ -899,6 +1264,7 @@ class SQLiteForecastStore:
             evaluated_at or _parse_timestamp(row["reconciled_at"]))
         return self._persist_evaluation_connection(connection, record)
 
+    @_translate_sqlite_errors
     def materialize_evaluation(self, forecast_id, evaluated_at=None):
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -906,6 +1272,7 @@ class SQLiteForecastStore:
             connection.commit()
             return result
 
+    @_translate_sqlite_errors
     def pending_evaluation_forecast_ids(self, limit=None):
         sql = """SELECT forecast_reconciliations.forecast_id FROM forecast_reconciliations
             LEFT JOIN evaluation_rows USING(forecast_id) WHERE evaluation_rows.forecast_id IS NULL
@@ -919,6 +1286,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return [row[0] for row in connection.execute(sql, parameters)]
 
+    @_translate_sqlite_errors
     def pending_evaluation_snapshot_forecast_ids(self, limit=None):
         sql = """SELECT evaluation_rows.forecast_id FROM evaluation_rows JOIN forecasts USING(forecast_id)
             WHERE NOT EXISTS (SELECT 1 FROM evaluation_run_snapshots WHERE evaluation_run_snapshots.evaluation_policy_version=evaluation_rows.evaluation_policy_version
@@ -938,6 +1306,7 @@ class SQLiteForecastStore:
         with closing(self._connect()) as connection:
             return [row[0] for row in connection.execute(sql, parameters)]
 
+    @_translate_sqlite_errors
     def pending_evaluation_snapshot_windows(self, limit=None):
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError("limit must be a positive integer")
@@ -1039,6 +1408,7 @@ class SQLiteForecastStore:
                 sensor_id, target_interval_end_start, target_interval_end_end, evaluation_policy_version)
             return self._evaluation_metrics(rows)
 
+    @_translate_sqlite_errors
     def create_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
                                        target_interval_end_start, target_interval_end_end, created_at,
                                        evaluation_policy_version=1):
@@ -1132,6 +1502,7 @@ class SQLiteForecastStore:
         except (TypeError, ValueError, ForecastIntegrityError, json.JSONDecodeError) as error:
             raise ForecastIntegrityError("invalid durable snapshot") from error
 
+    @_translate_sqlite_errors
     def find_evaluation_run_snapshot(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
                                      target_interval_end_start, target_interval_end_end, evaluation_policy_version=1):
         if not isinstance(model_version, str) or not model_version or type(sensor_id) is not int or sensor_id <= 0:
@@ -1181,6 +1552,7 @@ class SQLiteForecastStore:
             row["mae_difference"], row["snapshot_id"], row["membership_sha256"],
             _parse_timestamp(row["published_at"]))
 
+    @_translate_sqlite_errors
     def publish_consumer_performance(self, model_version, model_artifact_sha256,
                                      feature_schema_sha256, sensor_id, reference_time,
                                      published_at=None, evaluation_policy_version=1,
@@ -1246,6 +1618,7 @@ class SQLiteForecastStore:
                 connection.rollback()
                 raise
 
+    @_translate_sqlite_errors
     def current_consumer_performance(self, model_version, model_artifact_sha256,
                                      feature_schema_sha256, sensor_id,
                                      evaluation_policy_version=1, forecast_horizon_hours=6):
@@ -1258,6 +1631,7 @@ class SQLiteForecastStore:
                  evaluation_policy_version, forecast_horizon_hours)).fetchone()
             return self._consumer_publication_row(row)
 
+    @_translate_sqlite_errors
     def get_evaluation(self, forecast_id):
         with closing(self._connect()) as connection:
             return self._evaluation_row(connection.execute("SELECT * FROM evaluation_rows WHERE forecast_id=?", (forecast_id,)).fetchone())
@@ -1284,6 +1658,163 @@ class SQLiteForecastStore:
             return connection.execute("SELECT COUNT(*) FROM observation_revisions").fetchone()[0]
 
 
+class LibSQLForecastStore(SQLiteForecastStore):
+    def __init__(self, database_url, auth_token, read_only=False):
+        self.database_url = database_url
+        self.auth_token = auth_token
+        self.read_only = read_only
+
+    @staticmethod
+    def _load_driver():
+        try:
+            return importlib.import_module("libsql")
+        except ImportError as error:
+            raise ForecastStoreConfigurationError(
+                "AIRAWARE_LEDGER_BACKEND='libsql' requires the libsql package"
+            ) from error
+
+    def _connect(self):
+        driver = self._load_driver()
+        try:
+            raw = driver.connect(
+                database=self.database_url,
+                auth_token=self.auth_token,
+                timeout=30,
+                isolation_level=None,
+            )
+            if not self.read_only:
+                raw.execute("PRAGMA foreign_keys=ON")
+        except (driver.Error, ValueError) as error:
+            _raise_libsql_error(error)
+        return _LibSQLConnection(raw, driver.Error, read_only=self.read_only)
+
+    def _remote_tables(self, connection):
+        rows = connection.execute("PRAGMA table_list").fetchall()
+        return {row["name"] for row in rows
+                if row["schema"] == "main" and row["type"] == "table" and not row["name"].startswith("sqlite_")}
+
+    def _remote_schema_versions(self, connection):
+        return tuple(row[0] for row in connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version").fetchall())
+
+    def _validate_remote_schema(self, connection, expected_version=SCHEMA_VERSION):
+        required = {"schema_migrations", "forecasts", "observation_acquisitions", "forecast_reconciliations",
+            "observation_revisions", "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors",
+            "consumer_performance_publications"}
+        if expected_version >= 9:
+            required.add("monitoring_leases")
+        tables = self._remote_tables(connection)
+        if not required <= tables:
+            raise RuntimeError("unsupported schema")
+        versions = self._remote_schema_versions(connection)
+        if versions and max(versions) > SCHEMA_VERSION:
+            raise RuntimeError("unsupported schema version")
+        if versions != (expected_version,):
+            raise RuntimeError("unsupported schema")
+        self._validate_forecasts_schema(connection)
+        self._validate_m2_schema(connection)
+        self._validate_m3_schema(connection)
+        self._validate_m4_schema(connection)
+        self._validate_m6_schema(connection)
+        self._validate_m8_schema(connection)
+        if expected_version >= 9:
+            self._validate_m9_schema(connection)
+        if expected_version >= 10:
+            self._validate_m10_schema(connection)
+
+    def validate_existing(self):
+        with closing(self._connect()) as connection:
+            self._validate_remote_schema(connection)
+
+    def initialize(self):
+        if self.read_only:
+            raise LedgerDatabaseError("libSQL forecast store is read-only")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            tables = self._remote_tables(connection)
+            if tables:
+                if "schema_migrations" not in tables:
+                    raise RuntimeError("unsupported schema")
+                versions = self._remote_schema_versions(connection)
+                if versions == (SCHEMA_VERSION,):
+                    self._validate_remote_schema(connection)
+                    connection.commit()
+                    return
+                if versions not in ((8,), (9,)):
+                    self._validate_remote_schema(connection)
+                    return
+                self._validate_remote_schema(connection, expected_version=versions[0])
+                try:
+                    if versions == (8,):
+                        self._create_m9_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
+                    connection.execute("DELETE FROM schema_migrations WHERE version=?", (versions[0],))
+                    connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                self._validate_remote_schema(connection)
+                return
+            try:
+                connection.execute("""CREATE TABLE schema_migrations (
+                    version INTEGER NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)""")
+                connection.execute(self._forecast_schema())
+                self._create_m2_schema(connection)
+                self._create_m3_schema(connection)
+                self._create_m4_schema(connection)
+                self._create_m5_schema(connection)
+                self._create_m6_schema(connection)
+                self._create_m8_schema(connection)
+                self._create_m9_schema(connection)
+                self._create_m10_schema(connection)
+                connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        self.validate_existing()
+
+    def latest(self):
+        with closing(self._connect()) as connection:
+            return self._row(connection.execute(
+                "SELECT * FROM forecasts ORDER BY issued_at DESC, forecast_id DESC LIMIT 1").fetchone())
+
+    def current_consumer_performance(self, model_version, model_artifact_sha256,
+                                     feature_schema_sha256, sensor_id,
+                                     evaluation_policy_version=1, forecast_horizon_hours=6):
+        with closing(self._connect()) as connection:
+            row = connection.execute("""SELECT * FROM consumer_performance_publications
+                WHERE model_version=? AND model_artifact_sha256=? AND feature_schema_sha256=?
+                AND sensor_id=? AND evaluation_policy_version=? AND forecast_horizon_hours=?
+                ORDER BY publication_date DESC, published_at DESC, publication_id DESC LIMIT 1""",
+                (model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
+                 evaluation_policy_version, forecast_horizon_hours)).fetchone()
+            return self._consumer_publication_row(row)
+
+
+def create_forecast_store(path, read_only=False):
+    selected_backend = os.environ.get("AIRAWARE_LEDGER_BACKEND", "sqlite").strip().lower()
+    if selected_backend == "sqlite":
+        return SQLiteForecastStore(path, read_only=read_only)
+    if selected_backend == "libsql":
+        database_url = os.environ.get("AIRAWARE_TURSO_DATABASE_URL", "").strip()
+        auth_token = os.environ.get("AIRAWARE_TURSO_AUTH_TOKEN", "").strip()
+        missing = [name for name, value in (
+            ("AIRAWARE_TURSO_DATABASE_URL", database_url), ("AIRAWARE_TURSO_AUTH_TOKEN", auth_token)) if not value]
+        if missing:
+            raise ForecastStoreConfigurationError(
+                "libsql backend requires " + ", ".join(missing)
+            )
+        return LibSQLForecastStore(database_url, auth_token, read_only=read_only)
+    raise ForecastStoreConfigurationError(
+        f"unsupported AIRAWARE_LEDGER_BACKEND={selected_backend!r}; supported backends: sqlite, libsql"
+    )
+
+
 def _record_json(record):
     payload = asdict(record)
     for field in fields(record):
@@ -1300,7 +1831,7 @@ def _record_from_json(value):
 
 
 def issue_forecast(database_path, model_path, current_pm25_path, now=lambda: datetime.now(timezone.utc)):
-    store = SQLiteForecastStore(database_path)
+    store = create_forecast_store(database_path)
     try:
         from app.main import MODEL_VERSION, _current_prediction_request, _load_current_artifact, _predict, _validate_metadata
         from scripts.modeling.predict import load_artifact

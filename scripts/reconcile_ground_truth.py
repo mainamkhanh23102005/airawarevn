@@ -6,16 +6,16 @@ from pathlib import Path
 
 import httpx
 
-from app.forecast_ledger import SQLiteForecastStore
+from app.forecast_ledger import create_forecast_store
 from app.ground_truth_reconciler import GroundTruthReconciler, TruthPolicy
 from scripts.openaq import OpenAQObservationSource
 
 
 def run_reconciliation(database, raw_directory, api_key, limit=None, now=lambda: datetime.now(timezone.utc)):
-    store = SQLiteForecastStore(database)
+    store = create_forecast_store(database)
     store.initialize()
     with httpx.Client(timeout=30) as client:
-        source = OpenAQObservationSource(client, api_key, raw_directory, now=now)
+        source = OpenAQObservationSource(client, api_key, raw_directory, now=now, evidence_store=store)
         return GroundTruthReconciler(store, now=now, policy=TruthPolicy(1, 120), source=source, limit=limit).run()
 
 

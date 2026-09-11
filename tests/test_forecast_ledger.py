@@ -1,12 +1,14 @@
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import tempfile
 import threading
 import unittest
 import unicodedata
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -18,11 +20,17 @@ import pandas as pd
 
 from app.forecast_ledger import (
     FORECAST_NAMESPACE,
+    ForecastStoreConfigurationError,
     ForecastIntegrityError,
     ForecastRecord,
+    LedgerDatabaseError,
+    LedgerTransientError,
+    SCHEMA_VERSION,
+    MAX_RAW_EVIDENCE_BYTES,
     SQLiteForecastStore,
     canonical_feature_schema_json,
     canonical_identity_json,
+    create_forecast_store,
     feature_schema_sha256,
     issue_forecast,
     sha256_file,
@@ -31,6 +39,134 @@ from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 from scripts.modeling.features import V1_FEATURE_COLUMNS
 from scripts.modeling.train import save_artifact, train_v1_model
 from scripts.modeling.features import build_v1_features
+
+
+class RawEvidenceTests(unittest.TestCase):
+    def test_replace_cannot_mutate_evidence_with_recursive_triggers_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteForecastStore(Path(directory) / "ledger.db")
+            store.initialize()
+            payload = b"\x00\xff\r\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            store.insert_raw_evidence(digest, payload)
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                connection.execute("PRAGMA recursive_triggers=OFF")
+                for statement in ("INSERT OR REPLACE", "REPLACE"):
+                    with self.subTest(statement=statement), self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                        connection.execute(f"{statement} INTO observation_raw_evidence VALUES (?, ?)", (digest, b"changed"))
+                self.assertEqual(connection.execute("SELECT raw_payload FROM observation_raw_evidence").fetchone()[0], payload)
+
+    def test_concurrent_fresh_and_v9_initialization_rereads_after_lock(self):
+        for version in (0, 9):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "ledger.db"
+                store = SQLiteForecastStore(path)
+                if version == 9:
+                    store.initialize()
+                    with closing(sqlite3.connect(path)) as connection, connection:
+                        connection.execute("DROP TABLE observation_raw_evidence")
+                        connection.execute("PRAGMA user_version=9")
+                barrier = threading.Barrier(2)
+                errors = []
+
+                class SynchronizedConnection:
+                    def __init__(self, connection):
+                        self.connection = connection
+
+                    def execute(self, sql, *args):
+                        if sql == "BEGIN IMMEDIATE":
+                            barrier.wait(timeout=10)
+                        return self.connection.execute(sql, *args)
+
+                    def __getattr__(self, name):
+                        return getattr(self.connection, name)
+
+                connect = store._connect
+
+                def initialize():
+                    try:
+                        store.initialize()
+                    except Exception as error:
+                        errors.append(error)
+
+                with patch.object(store, "_connect", side_effect=lambda: SynchronizedConnection(connect())):
+                    threads = [threading.Thread(target=initialize) for _ in range(2)]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=20)
+                    self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual(errors, [])
+                store.validate_existing()
+
+    def test_v10_validation_rejects_missing_evidence_constraints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteForecastStore(Path(directory) / "ledger.db")
+            store.initialize()
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                for operation in ("insert", "update", "delete"):
+                    connection.execute(f"DROP TRIGGER observation_raw_evidence_no_{operation}")
+                connection.execute("DROP TABLE observation_raw_evidence")
+                connection.execute("CREATE TABLE observation_raw_evidence (raw_payload_sha256 TEXT NOT NULL PRIMARY KEY, raw_payload BLOB NOT NULL)")
+                for operation in ("INSERT", "UPDATE", "DELETE"):
+                    connection.execute(store._raw_evidence_trigger(operation))
+            with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
+                store.validate_existing()
+
+    def test_raw_evidence_validation_and_concurrent_idempotency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteForecastStore(Path(directory) / "ledger.db")
+            store.initialize()
+            for payload in (b"", b"abc", b"abc\n", b"x" * MAX_RAW_EVIDENCE_BYTES):
+                digest = hashlib.sha256(payload).hexdigest()
+                store.insert_raw_evidence(digest, payload)
+                store.insert_raw_evidence(digest, payload)
+            for digest, payload in (("A" * 64, b"abc"), ("z" * 64, b"abc"),
+                    (hashlib.sha256(b"abc").hexdigest(), "abc"),
+                    (hashlib.sha256(b"abc").hexdigest(), bytearray(b"abc")),
+                    ("a" * 64, b"x" * (MAX_RAW_EVIDENCE_BYTES + 1))):
+                with self.subTest(digest=digest), self.assertRaises(ValueError):
+                    store.insert_raw_evidence(digest, payload)
+            errors = []
+            barrier = threading.Barrier(4)
+
+            def insert():
+                try:
+                    barrier.wait(timeout=10)
+                    store.insert_raw_evidence(hashlib.sha256(b"concurrent").hexdigest(), b"concurrent")
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=insert) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM observation_raw_evidence").fetchone()[0], 5)
+            reader = SQLiteForecastStore(store.path, read_only=True)
+            reader.validate_existing()
+            with self.assertRaises(LedgerDatabaseError):
+                reader.insert_raw_evidence(hashlib.sha256(b"new").hexdigest(), b"new")
+
+    def test_raw_evidence_is_exact_idempotent_and_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteForecastStore(Path(directory) / "ledger.db")
+            store.initialize()
+            payload = b'{ "results": [], "value": 1.2300 }\n'
+            digest = hashlib.sha256(payload).hexdigest()
+            store.insert_raw_evidence(digest, payload)
+            store.insert_raw_evidence(digest, payload)
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                self.assertEqual(connection.execute("SELECT raw_payload FROM observation_raw_evidence").fetchall(), [(payload,)])
+                for sql in ("UPDATE observation_raw_evidence SET raw_payload=raw_payload", "DELETE FROM observation_raw_evidence"):
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        connection.execute(sql)
+            with self.assertRaises(ValueError):
+                store.insert_raw_evidence("a" * 64, payload)
+            store.validate_existing()
 
 
 class ForecastLedgerTests(unittest.TestCase):
@@ -109,6 +245,41 @@ class ForecastLedgerTests(unittest.TestCase):
         end = datetime.combine(publication_date, time.min, ict).astimezone(timezone.utc)
         return publication_date, end - timedelta(days=30), end
 
+    def test_store_factory_defaults_to_sqlite_when_backend_is_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            store = create_forecast_store(self.database)
+        self.assertIsInstance(store, SQLiteForecastStore)
+        self.assertEqual(store.path, self.database)
+        self.assertFalse(store.read_only)
+
+    def test_store_factory_accepts_explicit_sqlite(self):
+        with patch.dict(os.environ, {"AIRAWARE_LEDGER_BACKEND": "sqlite"}, clear=True):
+            store = create_forecast_store(self.database)
+        self.assertIsInstance(store, SQLiteForecastStore)
+
+    def test_store_factory_unknown_backend_fails_closed(self):
+        with patch.dict(os.environ, {"AIRAWARE_LEDGER_BACKEND": "unknown"}, clear=True), patch(
+                "app.forecast_ledger.SQLiteForecastStore") as sqlite_store:
+            with self.assertRaisesRegex(ForecastStoreConfigurationError, "unsupported AIRAWARE_LEDGER_BACKEND='unknown'"):
+                create_forecast_store(self.database)
+        sqlite_store.assert_not_called()
+
+    def test_store_factory_passes_read_only_to_sqlite(self):
+        with patch.dict(os.environ, {"AIRAWARE_LEDGER_BACKEND": "sqlite"}, clear=True):
+            store = create_forecast_store(self.database, read_only=True)
+        self.assertIsInstance(store, SQLiteForecastStore)
+        self.assertTrue(store.read_only)
+        self.assertEqual(store.path, self.database)
+
+    def test_sqlite_store_translates_runtime_database_errors(self):
+        store = SQLiteForecastStore(self.database)
+        with patch.object(store, "_connect", side_effect=sqlite3.OperationalError("unable to open database file")):
+            with self.assertRaises(LedgerDatabaseError):
+                store.latest()
+        with patch.object(store, "_connect", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(LedgerTransientError):
+                store.latest()
+
 
     def test_canonical_identity_and_uuid_are_exact_and_unicode_normalized(self):
         record = ForecastRecord.create(**{**self.record.as_dict(), "forecast_id": None, "model_version": "v\u0069\u0301"})
@@ -175,8 +346,8 @@ class ForecastLedgerTests(unittest.TestCase):
         result = store.insert(self.record)
         self.assertEqual(result.status, "inserted")
         self.assertEqual(SQLiteForecastStore(self.database).latest(), self.record)
-        with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_identical_insert_is_idempotent_but_conflict_never_overwrites(self):
         store = SQLiteForecastStore(self.database)
@@ -223,6 +394,69 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertEqual(statuses.count("inserted"), 1)
         self.assertEqual(statuses.count("already_exists"), 7)
 
+    def test_monitoring_lease_acquire_reacquire_expiry_takeover_and_release(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        lease_name = "production-monitoring"
+
+        self.assertTrue(store.acquire_monitoring_lease(lease_name, "owner-a", now, 60))
+        self.assertFalse(store.acquire_monitoring_lease(lease_name, "owner-b", now, 60))
+        self.assertTrue(store.acquire_monitoring_lease(
+            lease_name, "owner-a", now + timedelta(seconds=10), 60))
+        with closing(store._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT owner_id, acquired_at, expires_at FROM monitoring_leases WHERE lease_name=?",
+                (lease_name,)).fetchone()
+        self.assertEqual(row["owner_id"], "owner-a")
+        self.assertEqual(row["acquired_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(row["expires_at"], "2026-01-01T00:01:10Z")
+
+        takeover = now + timedelta(seconds=70)
+        self.assertTrue(store.acquire_monitoring_lease(lease_name, "owner-b", takeover, 60))
+        self.assertFalse(store.release_monitoring_lease(lease_name, "owner-a"))
+        self.assertTrue(store.release_monitoring_lease(lease_name, "owner-b"))
+        self.assertTrue(store.acquire_monitoring_lease(
+            lease_name, "owner-a", takeover + timedelta(seconds=1), 60))
+
+    def test_monitoring_lease_validates_identity_time_and_ttl(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        aware = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for lease_name, owner_id in (("", "owner"), ("lease", ""), (None, "owner"), ("lease", None)):
+            with self.subTest(lease_name=lease_name, owner_id=owner_id), self.assertRaises(ValueError):
+                store.acquire_monitoring_lease(lease_name, owner_id, aware, 60)
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            store.acquire_monitoring_lease("lease", "owner", datetime(2026, 1, 1), 60)
+        for ttl in (0, -1, 1.5, True):
+            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
+                store.acquire_monitoring_lease("lease", "owner", aware, ttl)
+
+    def test_concurrent_monitoring_lease_acquisition_has_one_owner(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        barrier = threading.Barrier(8)
+        outcomes = []
+        errors = []
+
+        def acquire(index):
+            try:
+                barrier.wait()
+                outcomes.append(store.acquire_monitoring_lease(
+                    "production-monitoring", f"owner-{index}", now, 60))
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=acquire, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertFalse(errors)
+        self.assertEqual(outcomes.count(True), 1)
+        self.assertEqual(outcomes.count(False), 7)
+
     def test_changed_artifact_or_schema_creates_distinct_identity(self):
         one = self.record
         two = ForecastRecord.create(**{**one.as_dict(), "forecast_id": None, "model_artifact_sha256": "c" * 64})
@@ -259,7 +493,7 @@ class ForecastLedgerTests(unittest.TestCase):
     def test_schema_declares_all_immutable_columns_primary_key_and_natural_unique(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             columns = {row[1]: row for row in connection.execute("PRAGMA table_info(forecasts)")}
             indexes = list(connection.execute("PRAGMA index_list(forecasts)"))
             unique_columns = [tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})")) for index in indexes if index[2]]
@@ -481,7 +715,7 @@ class ForecastLedgerTests(unittest.TestCase):
             "v1", "a" * 64, "b" * 64, 13502151, reference, reference + timedelta(minutes=1), minimum_verified_count=48)
         self.assertEqual(first, second)
         self.assertEqual(first.publication_id, second.publication_id)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             count = connection.execute("SELECT COUNT(*) FROM consumer_performance_publications WHERE publication_id=?",
                 (first.publication_id,)).fetchone()[0]
         self.assertEqual(count, 1)
@@ -499,7 +733,7 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertEqual(later.verified_count, 49)
         self.assertNotEqual(earlier.membership_sha256, later.membership_sha256)
         self.assertNotEqual(earlier.publication_id, later.publication_id)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             rows = {row[0] for row in connection.execute("SELECT publication_id FROM consumer_performance_publications")}
             stored = connection.execute("SELECT verified_count, membership_sha256 FROM consumer_performance_publications WHERE publication_id=?",
                 (earlier.publication_id,)).fetchone()

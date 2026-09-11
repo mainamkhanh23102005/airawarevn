@@ -3,12 +3,19 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from app.forecast_ledger import EvaluationRecord, ForecastIntegrityError, ForecastRecord, SQLiteForecastStore
+from app.forecast_ledger import (
+    EvaluationRecord,
+    ForecastIntegrityError,
+    ForecastRecord,
+    SCHEMA_VERSION,
+    SQLiteForecastStore,
+)
 from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 
 
@@ -50,20 +57,20 @@ class EvaluationPersistenceTests(unittest.TestCase):
     def test_v2_migration_preserves_existing_rows_and_rolls_back_on_failure(self):
         store = SQLiteForecastStore(self.database)
         self.database.parent.mkdir(parents=True, exist_ok=True)
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             connection.execute(store._forecast_schema())
             store._create_m2_schema(connection)
             connection.execute("PRAGMA user_version=2")
         store.insert(self.forecast)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             before = connection.execute("SELECT * FROM forecasts").fetchone()
         store.initialize()
-        with sqlite3.connect(self.database) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(connection.execute("SELECT * FROM forecasts").fetchone(), before)
         failed = Path(self.directory.name) / "failed.sqlite3"
         failed_store = SQLiteForecastStore(failed)
-        with failed_store._connect() as connection:
+        with closing(failed_store._connect()) as connection, connection:
             connection.execute(failed_store._forecast_schema())
             failed_store._create_m2_schema(connection)
             connection.execute("PRAGMA user_version=2")
@@ -71,12 +78,12 @@ class EvaluationPersistenceTests(unittest.TestCase):
         with patch.object(failed_store, "_create_m3_schema", side_effect=RuntimeError("boom")):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 failed_store.initialize()
-        with sqlite3.connect(failed) as connection:
+        with closing(sqlite3.connect(failed)) as connection, connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_rows'").fetchone())
 
     def _capture_rows(self, store, names):
-        with sqlite3.connect(store.path) as connection:
+        with closing(sqlite3.connect(store.path)) as connection, connection:
             return {name: [tuple(row) for row in connection.execute(f"SELECT * FROM {name} ORDER BY rowid").fetchall()] for name in names}
 
     def test_v8_migration_preserves_rows_and_recreates_consumer_publications(self):
@@ -103,13 +110,15 @@ class EvaluationPersistenceTests(unittest.TestCase):
         tables = ("forecasts", "observation_acquisitions", "forecast_reconciliations", "observation_revisions",
             "evaluation_rows", "evaluation_run_snapshots", "evaluation_cohort_cursors")
         before = self._capture_rows(store, tables)
-        with sqlite3.connect(store.path) as connection:
+        with closing(sqlite3.connect(store.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("DROP TABLE consumer_performance_publications")
+            connection.execute("DROP TABLE monitoring_leases")
+            connection.execute("DROP TABLE observation_raw_evidence")
             connection.execute("PRAGMA user_version=7")
         store.initialize()
-        with sqlite3.connect(store.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='consumer_performance_current_idx'").fetchone())
             foreign = {(row[3], row[2], row[4]) for row in connection.execute("PRAGMA foreign_key_list(consumer_performance_publications)")}
             self.assertEqual(foreign, {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")})
@@ -129,7 +138,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
                 path = Path(self.directory.name) / f"m3-schema-{index}.sqlite3"
                 store = SQLiteForecastStore(path)
                 store.initialize()
-                with sqlite3.connect(path) as connection:
+                with closing(sqlite3.connect(path)) as connection, connection:
                     schema = connection.execute("SELECT sql FROM sqlite_master WHERE name='evaluation_rows'").fetchone()[0]
                     connection.execute("PRAGMA foreign_keys=OFF")
                     connection.execute("ALTER TABLE evaluation_rows RENAME TO old_evaluation_rows")
@@ -141,7 +150,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
     def test_aggregate_candidate_uses_cohort_cursor_and_snapshot_identity_index(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             plan = connection.execute("""EXPLAIN QUERY PLAN SELECT model_version
                 FROM evaluation_cohort_cursors
                 WHERE evaluation_count>=2 AND NOT EXISTS (
@@ -165,7 +174,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
     def test_fresh_m3_schema_rejects_null_evaluation_id(self):
         store = SQLiteForecastStore(self.database)
         store.initialize()
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("""INSERT INTO evaluation_rows VALUES (
                     NULL, 'forecast', 'reconciliation', 9, '2026-01-01T00:00:00+00:00',
@@ -194,8 +203,8 @@ class EvaluationPersistenceTests(unittest.TestCase):
 
     def test_fresh_schema_and_materialization_are_immutable_and_idempotent(self):
         store = self._settled_store()
-        with store._connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+        with closing(store._connect()) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE name='evaluation_rows'").fetchone())
         first = store.materialize_evaluation(self.forecast.forecast_id)
         self.assertEqual((first.status, first.record.observed_pm25, first.record.model_error, first.record.persistence_error),
@@ -218,7 +227,7 @@ class EvaluationPersistenceTests(unittest.TestCase):
                 "value_decimal": Decimal("13"), "unit": "µg/m³", "record_id": 2}])
         GroundTruthReconciler(store, now=lambda: start + timedelta(hours=4)).reconcile(second, batch)
         ordered = sorted((self.forecast, second), key=lambda record: (record.target_interval_end, record.forecast_id))
-        with store._connect() as connection:
+        with closing(store._connect()) as connection, connection:
             connection.execute("CREATE TRIGGER fail_later_evaluation BEFORE INSERT ON evaluation_rows "
                 f"WHEN NEW.forecast_id = '{ordered[1].forecast_id}' BEGIN SELECT RAISE(ABORT, 'boom'); END")
         with self.assertRaisesRegex(ForecastIntegrityError, "evaluation identity conflict"):

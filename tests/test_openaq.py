@@ -239,6 +239,138 @@ class FetchTests(unittest.TestCase):
         client.close()
 
 
+class EvidenceTests(unittest.TestCase):
+    def test_oversized_stream_stops_early_and_closes_without_evidence(self):
+        from app.ground_truth_reconciler import SourceTransportError
+        consumed = []
+        closed = []
+
+        class Stream(httpx.SyncByteStream):
+            def __iter__(self):
+                for index in range(100):
+                    consumed.append(index)
+                    yield b" " * 65536
+
+            def close(self):
+                closed.append(True)
+
+        store = Mock()
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=Stream()))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), evidence_store=store)
+            with self.assertRaisesRegex(SourceTransportError, "size limit"):
+                source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(len(consumed), 33)
+        self.assertEqual(closed, [True])
+        store.insert_raw_evidence.assert_not_called()
+
+    def test_exact_limit_bytes_persist_before_parsing_and_cached_batch_creation(self):
+        from hashlib import sha256
+        from app.ground_truth_reconciler import AcquisitionBatch
+        payload = b'{ "results": [] }\n'
+        payload += b" " * (openaq.MAX_RAW_EVIDENCE_BYTES - len(payload))
+        digest = sha256(payload).hexdigest()
+        stored = {}
+        events = []
+        loads = json.loads
+        create = AcquisitionBatch.create
+
+        def persist(raw_payload_sha256, raw_payload):
+            self.assertEqual((raw_payload_sha256, raw_payload), (digest, payload))
+            stored.setdefault(raw_payload_sha256, raw_payload)
+            events.append("persist")
+
+        def parse(value, **kwargs):
+            if isinstance(value, bytes):
+                self.assertEqual(events[-1], "persist")
+                events.append("parse")
+            return loads(value, **kwargs)
+
+        def build(**kwargs):
+            self.assertEqual(stored[kwargs["raw_payload_sha256"]], payload)
+            events.append("batch")
+            return create(**kwargs)
+
+        calls = Mock(side_effect=lambda request: httpx.Response(200, content=payload))
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(calls)) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), evidence_store=Mock(insert_raw_evidence=persist))
+            with patch.object(openaq.json, "loads", side_effect=parse), patch.object(AcquisitionBatch, "create", side_effect=build):
+                first = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+                second = source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+            provenance = loads(next(Path(directory).glob("*.provenance.json")).read_text())
+            self.assertEqual(Path(provenance["raw_payload_path"]).read_bytes(), payload)
+        self.assertEqual(events, ["persist", "parse", "batch"] * 2)
+        self.assertEqual(first, second)
+        self.assertEqual(stored, {digest: payload})
+        self.assertEqual(calls.call_count, 1)
+
+    def test_malformed_json_is_durable_before_parse_failure(self):
+        from hashlib import sha256
+        from app.ground_truth_reconciler import SourceParseError
+        payload = b'{"results": broken}\n'
+        store = Mock()
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=payload))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), evidence_store=store)
+            for _ in range(2):
+                with self.assertRaises(SourceParseError):
+                    source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+        self.assertEqual(store.insert_raw_evidence.call_count, 2)
+        for call in store.insert_raw_evidence.call_args_list:
+            self.assertEqual(call.args, (sha256(payload).hexdigest(), payload))
+
+    def test_evidence_database_failure_translates_before_parsing_or_next_page(self):
+        from app.forecast_ledger import LedgerDatabaseError
+        for cached in (False, True):
+            with self.subTest(cached=cached), tempfile.TemporaryDirectory() as directory:
+                calls = Mock(side_effect=lambda request: response([hour_row()]))
+                with httpx.Client(transport=httpx.MockTransport(calls)) as client:
+                    source = openaq.OpenAQObservationSource(client, "key", Path(directory))
+                    args = (9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+                    if cached:
+                        source.acquire(*args)
+                    source.evidence_store = Mock(insert_raw_evidence=Mock(side_effect=LedgerDatabaseError("unavailable")))
+                    with patch.object(openaq, "normalize_measurement_for_reconciliation") as normalize:
+                        with self.assertRaisesRegex(LedgerDatabaseError, "unavailable"):
+                            source.acquire(*args)
+                        normalize.assert_not_called()
+                self.assertEqual(calls.call_count, 1)
+
+    def test_evidence_integrity_conflict_translates_to_per_forecast_failure(self):
+        from app.forecast_ledger import ForecastIntegrityError
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: response([hour_row()]))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory),
+                evidence_store=Mock(insert_raw_evidence=Mock(side_effect=ForecastIntegrityError("collision"))))
+            with self.assertRaisesRegex(ForecastIntegrityError, "collision"):
+                source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+
+    def test_stream_timeout_retries_then_translates_without_partial_evidence(self):
+        from app.ground_truth_reconciler import SourceTransportError
+        closed = []
+
+        class Stream(httpx.SyncByteStream):
+            def __iter__(self):
+                yield b'{"results":'
+                raise httpx.ReadTimeout("timed out")
+
+            def close(self):
+                closed.append(True)
+
+        sleep = Mock()
+        store = Mock()
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=Stream()))) as client:
+            source = openaq.OpenAQObservationSource(client, "key", Path(directory), sleep=sleep, evidence_store=store)
+            with self.assertRaisesRegex(SourceTransportError, "after retries"):
+                source.acquire(9, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(len(closed), 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 4])
+        store.insert_raw_evidence.assert_not_called()
+
+
 class CoverageTests(unittest.TestCase):
     def test_sensor_metadata_enriches_compact_discovery_sensor_for_arbitrary_id(self):
         compact = {"sensor_id": 24680, "parameter_name": "pm25", "datetimeFirst": None, "datetimeLast": None}

@@ -1,5 +1,4 @@
 import asyncio
-import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,7 +8,7 @@ from unittest.mock import patch
 
 from app import main
 from app.evaluation_monitor import materialize_available_evaluations
-from app.forecast_ledger import ForecastRecord, SQLiteForecastStore
+from app.forecast_ledger import ForecastRecord, LedgerDatabaseError, SQLiteForecastStore
 from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 
 
@@ -56,7 +55,7 @@ class EvaluationWorkerTests(unittest.TestCase):
 
     def test_worker_isolates_one_recoverable_materialization_failure(self):
         self._settle()
-        with patch.object(self.store, "materialize_evaluation", side_effect=sqlite3.OperationalError("busy")):
+        with patch.object(self.store, "materialize_evaluation", side_effect=LedgerDatabaseError("busy")):
             result = materialize_available_evaluations(self.store)
         self.assertEqual(result.results, ((self.forecast.forecast_id, "failed", "database_error"),))
         self.assertEqual(self.store.count_evaluations(), 0)
@@ -121,7 +120,7 @@ class EvaluationWorkerTests(unittest.TestCase):
         aggregate = self.store.pending_evaluation_snapshot_windows()[0]
         with patch.object(self.store, "pending_evaluation_snapshot_forecast_ids", return_value=[]), patch.object(
                 self.store, "pending_evaluation_snapshot_windows", return_value=[aggregate]), patch.object(
-                self.store, "create_evaluation_run_snapshot", side_effect=sqlite3.OperationalError("busy")):
+                self.store, "create_evaluation_run_snapshot", side_effect=LedgerDatabaseError("busy")):
             failed = materialize_available_evaluations(self.store)
         self.assertEqual(failed.counts, {})
         self.assertEqual(failed.snapshot_results, ((None, "failed", "database_error"),))
