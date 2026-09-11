@@ -21,7 +21,8 @@ FORECAST_NAMESPACE = uuid.UUID("e60f879b-90cf-51a4-8936-aad3c962371c")
 EVALUATION_NAMESPACE = uuid.UUID("1e772429-52c1-5f08-a957-88d6a5f5abbd")
 EVALUATION_RUN_NAMESPACE = uuid.UUID("3c03496f-c34f-5b71-a62a-3a3b6430c613")
 CONSUMER_PUBLICATION_NAMESPACE = uuid.UUID("16ca2b67-725b-52f8-9a45-9c085fd6307d")
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+MAX_RAW_EVIDENCE_BYTES = 2 * 1024 * 1024
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -453,6 +454,7 @@ class ForecastStore(Protocol):
     def latest(self): ...
     def eligible_forecasts(self, now, delay_minutes, limit=None): ...
     def forecasts_for_targets(self, targets): ...
+    def insert_raw_evidence(self, raw_payload_sha256, raw_payload): ...
     def persist_acquisition(self, batch): ...
     def settle(self, forecast, batch, candidates, reconciled_at, policy): ...
     def materialize_evaluation(self, forecast_id, evaluated_at=None): ...
@@ -656,6 +658,62 @@ class SQLiteForecastStore:
         if foreign != {("snapshot_id", "evaluation_run_snapshots", "snapshot_id")}:
             raise RuntimeError("unsupported schema")
 
+    def _create_m10_schema(self, connection):
+        connection.execute(f"""CREATE TABLE observation_raw_evidence (
+            raw_payload_sha256 TEXT NOT NULL PRIMARY KEY
+                CHECK(length(raw_payload_sha256)=64 AND raw_payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+            raw_payload BLOB NOT NULL CHECK(typeof(raw_payload)='blob' AND length(raw_payload)<={MAX_RAW_EVIDENCE_BYTES}))""")
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            connection.execute(self._raw_evidence_trigger(operation))
+
+    @staticmethod
+    def _raw_evidence_trigger(operation):
+        condition = ("WHEN EXISTS (SELECT 1 FROM observation_raw_evidence "
+            "WHERE raw_payload_sha256=NEW.raw_payload_sha256 OR rowid=NEW.rowid)") if operation == "INSERT" else ""
+        return f"""CREATE TRIGGER observation_raw_evidence_no_{operation.lower()}
+            BEFORE {operation} ON observation_raw_evidence
+            {condition}
+            BEGIN SELECT RAISE(ABORT, 'raw evidence is append-only'); END"""
+
+    def _validate_m10_schema(self, connection):
+        info = list(connection.execute("PRAGMA table_info(observation_raw_evidence)"))
+        schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='observation_raw_evidence'").fetchone()
+        normalized_schema = "" if schema is None else "".join(schema[0].lower().split())
+        required_checks = ("check(length(raw_payload_sha256)=64andraw_payload_sha256notglob'*[^0-9a-f]*')",
+            "check(typeof(raw_payload)='blob'andlength(raw_payload)<=2097152)")
+        if ({row[1] for row in info} != {"raw_payload_sha256", "raw_payload"}
+                or {row[1] for row in info if row[5]} != {"raw_payload_sha256"}
+                or {row[1]: row[2].upper() for row in info} != {"raw_payload_sha256": "TEXT", "raw_payload": "BLOB"}
+                or any(not row[3] for row in info)
+                or any(check not in normalized_schema for check in required_checks)):
+            raise RuntimeError("unsupported schema")
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (f"observation_raw_evidence_no_{operation.lower()}",)).fetchone()
+            if row is None or " ".join(row[0].split()) != " ".join(self._raw_evidence_trigger(operation).split()):
+                raise RuntimeError("unsupported schema")
+
+    @_translate_sqlite_errors
+    def insert_raw_evidence(self, raw_payload_sha256, raw_payload):
+        _hash(raw_payload_sha256, "raw_payload_sha256")
+        if (not isinstance(raw_payload, bytes) or len(raw_payload) > MAX_RAW_EVIDENCE_BYTES
+                or hashlib.sha256(raw_payload).hexdigest() != raw_payload_sha256):
+            raise ValueError("invalid raw evidence")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute("SELECT raw_payload FROM observation_raw_evidence WHERE raw_payload_sha256=?",
+                    (raw_payload_sha256,)).fetchone()
+                if row is None:
+                    connection.execute("INSERT INTO observation_raw_evidence VALUES (?, ?)",
+                        (raw_payload_sha256, raw_payload))
+                elif bytes(row[0]) != raw_payload:
+                    raise ForecastIntegrityError("raw evidence hash collision")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
     def _create_m9_schema(self, connection):
         connection.execute("""CREATE TABLE monitoring_leases (
             lease_name TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL,
@@ -714,11 +772,13 @@ class SQLiteForecastStore:
             self._validate_m6_schema(connection)
             self._validate_m8_schema(connection)
             self._validate_m9_schema(connection)
+            self._validate_m10_schema(connection)
 
     @_translate_sqlite_errors
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if version > SCHEMA_VERSION:
@@ -736,8 +796,9 @@ class SQLiteForecastStore:
                 self._validate_m6_schema(connection)
                 self._validate_m8_schema(connection)
                 self._validate_m9_schema(connection)
+                self._validate_m10_schema(connection)
+                connection.commit()
                 return
-            connection.execute("BEGIN IMMEDIATE")
             try:
                 if version == 0:
                     connection.execute(self._forecast_schema())
@@ -767,6 +828,7 @@ class SQLiteForecastStore:
                     self._validate_m8_schema(connection)
                     self._create_m9_schema(connection)
                     self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -785,6 +847,7 @@ class SQLiteForecastStore:
                     self._validate_m8_schema(connection)
                     self._create_m9_schema(connection)
                     self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -800,6 +863,7 @@ class SQLiteForecastStore:
                     self._validate_m8_schema(connection)
                     self._create_m9_schema(connection)
                     self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -813,6 +877,7 @@ class SQLiteForecastStore:
                     self._validate_m8_schema(connection)
                     self._create_m9_schema(connection)
                     self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -827,6 +892,19 @@ class SQLiteForecastStore:
                         raise RuntimeError("unsupported schema")
                     self._create_m9_schema(connection)
                     self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
+                    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    connection.commit()
+                    return
+                elif version == 9:
+                    self._validate_forecasts_schema(connection)
+                    self._validate_m2_schema(connection)
+                    self._validate_m3_schema(connection)
+                    self._validate_m4_schema(connection)
+                    self._validate_m6_schema(connection)
+                    self._validate_m8_schema(connection)
+                    self._validate_m9_schema(connection)
+                    self._create_m10_schema(connection)
                     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     connection.commit()
                     return
@@ -838,6 +916,7 @@ class SQLiteForecastStore:
                 self._create_m8_schema(connection)
                 self._create_m9_schema(connection)
                 self._backfill_evaluation_cohort_cursors(connection)
+                self._create_m10_schema(connection)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 connection.commit()
             except Exception:
@@ -1640,6 +1719,8 @@ class LibSQLForecastStore(SQLiteForecastStore):
         self._validate_m8_schema(connection)
         if expected_version >= 9:
             self._validate_m9_schema(connection)
+        if expected_version >= 10:
+            self._validate_m10_schema(connection)
 
     def validate_existing(self):
         with closing(self._connect()) as connection:
@@ -1649,6 +1730,7 @@ class LibSQLForecastStore(SQLiteForecastStore):
         if self.read_only:
             raise LedgerDatabaseError("libSQL forecast store is read-only")
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
             tables = self._remote_tables(connection)
             if tables:
                 if "schema_migrations" not in tables:
@@ -1656,16 +1738,18 @@ class LibSQLForecastStore(SQLiteForecastStore):
                 versions = self._remote_schema_versions(connection)
                 if versions == (SCHEMA_VERSION,):
                     self._validate_remote_schema(connection)
+                    connection.commit()
                     return
-                if versions != (8,) or "monitoring_leases" in tables:
+                if versions not in ((8,), (9,)):
                     self._validate_remote_schema(connection)
                     return
-                self._validate_remote_schema(connection, expected_version=8)
-                connection.execute("BEGIN IMMEDIATE")
+                self._validate_remote_schema(connection, expected_version=versions[0])
                 try:
-                    self._create_m9_schema(connection)
+                    if versions == (8,):
+                        self._create_m9_schema(connection)
                     self._validate_m9_schema(connection)
-                    connection.execute("DELETE FROM schema_migrations WHERE version=?", (8,))
+                    self._create_m10_schema(connection)
+                    connection.execute("DELETE FROM schema_migrations WHERE version=?", (versions[0],))
                     connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
                     connection.commit()
@@ -1674,7 +1758,6 @@ class LibSQLForecastStore(SQLiteForecastStore):
                     raise
                 self._validate_remote_schema(connection)
                 return
-            connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute("""CREATE TABLE schema_migrations (
                     version INTEGER NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)""")
@@ -1686,6 +1769,7 @@ class LibSQLForecastStore(SQLiteForecastStore):
                 self._create_m6_schema(connection)
                 self._create_m8_schema(connection)
                 self._create_m9_schema(connection)
+                self._create_m10_schema(connection)
                 connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, _timestamp(datetime.now(timezone.utc))))
                 connection.commit()

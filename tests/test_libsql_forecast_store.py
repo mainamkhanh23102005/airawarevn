@@ -1,5 +1,8 @@
+import hashlib
 import os
 import sqlite3
+import tempfile
+import threading
 import unittest
 import uuid
 from contextlib import closing
@@ -82,6 +85,33 @@ def _forecast(model_hash="a" * 64, prediction_time=None, issued_at=None):
     )
 
 
+def _assert_raw_evidence_contract(test, store):
+    payload = b'{ "results": [], "value": 1.2300 }\r\n\x00\xff'
+    digest = hashlib.sha256(payload).hexdigest()
+    store.insert_raw_evidence(digest, payload)
+    store.insert_raw_evidence(digest, payload)
+    for sql, parameters in (
+            ("UPDATE observation_raw_evidence SET raw_payload=? WHERE raw_payload_sha256=?", (b"changed", digest)),
+            ("DELETE FROM observation_raw_evidence WHERE raw_payload_sha256=?", (digest,)),
+            ("INSERT OR REPLACE INTO observation_raw_evidence VALUES (?, ?)", (digest, b"changed")),
+            ("REPLACE INTO observation_raw_evidence VALUES (?, ?)", (digest, b"changed")),
+            ("INSERT OR REPLACE INTO observation_raw_evidence(rowid, raw_payload_sha256, raw_payload) "
+             "SELECT rowid, ?, ? FROM observation_raw_evidence WHERE raw_payload_sha256=?",
+             (hashlib.sha256(b"changed").hexdigest(), b"changed", digest))):
+        with test.subTest(sql=sql), closing(store._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                with test.assertRaisesRegex((sqlite3.IntegrityError, LedgerDatabaseError), "append-only"):
+                    connection.execute(sql, parameters)
+            finally:
+                connection.rollback()
+    with closing(store._connect()) as connection:
+        rows = connection.execute("SELECT raw_payload FROM observation_raw_evidence WHERE raw_payload_sha256=?", (digest,)).fetchall()
+        test.assertEqual([bytes(row[0]) for row in rows], [payload])
+    with test.assertRaises(ValueError):
+        store.insert_raw_evidence(digest, payload + b" ")
+
+
 class LibSQLForecastStoreTests(unittest.TestCase):
     def setUp(self):
         self.driver = _SQLiteLibSQLDriver()
@@ -148,6 +178,7 @@ class LibSQLForecastStoreTests(unittest.TestCase):
     def test_remote_v8_schema_migrates_to_monitoring_leases(self):
         self.store.initialize()
         with closing(self.store._connect()) as connection:
+            connection.execute("DROP TABLE observation_raw_evidence")
             connection.execute("DROP TABLE monitoring_leases")
             connection.execute("DELETE FROM schema_migrations")
             connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -157,6 +188,71 @@ class LibSQLForecastStoreTests(unittest.TestCase):
         with closing(self.store._connect()) as connection:
             self.assertEqual(self.store._remote_schema_versions(connection), (SCHEMA_VERSION,))
             self.assertIn("monitoring_leases", self.store._remote_tables(connection))
+
+    def test_remote_v9_migration_preserves_forecast_and_rolls_back_failed_ddl(self):
+        self.store.initialize()
+        forecast = _forecast()
+        self.store.insert(forecast)
+        with closing(self.store._connect()) as connection:
+            connection.execute("DROP TABLE observation_raw_evidence")
+            connection.execute("UPDATE schema_migrations SET version=9")
+            connection.commit()
+        create = self.store._create_m10_schema
+
+        def fail_after_ddl(connection):
+            create(connection)
+            raise RuntimeError("migration probe")
+
+        with patch.object(self.store, "_create_m10_schema", side_effect=fail_after_ddl):
+            with self.assertRaisesRegex(RuntimeError, "migration probe"):
+                self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            self.assertEqual(self.store._remote_schema_versions(connection), (9,))
+            self.assertNotIn("observation_raw_evidence", self.store._remote_tables(connection))
+        self.store.initialize()
+        self.store.validate_existing()
+        self.assertEqual(self.store.get_by_id(forecast.forecast_id), forecast)
+        _assert_raw_evidence_contract(self, self.store)
+
+    def test_concurrent_remote_fresh_and_v9_initialization(self):
+        for version in (0, 9):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                database = os.path.join(directory, "remote.db")
+
+                class FileDriver:
+                    Error = sqlite3.Error
+
+                    def connect(self, **kwargs):
+                        return sqlite3.connect(database, timeout=30, isolation_level=None)
+
+                with patch.object(LibSQLForecastStore, "_load_driver", return_value=FileDriver()):
+                    if version == 9:
+                        self.store.initialize()
+                        with closing(self.store._connect()) as connection:
+                            connection.execute("DROP TABLE observation_raw_evidence")
+                            connection.execute("UPDATE schema_migrations SET version=9")
+                    barrier = threading.Barrier(2)
+                    errors = []
+
+                    def initialize():
+                        try:
+                            barrier.wait(timeout=10)
+                            self.store.initialize()
+                        except Exception as error:
+                            errors.append(error)
+
+                    threads = [threading.Thread(target=initialize) for _ in range(2)]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=20)
+                    self.assertTrue(all(not thread.is_alive() for thread in threads))
+                    self.assertEqual(errors, [])
+                    self.store.validate_existing()
+
+    def test_remote_raw_evidence_contract(self):
+        self.store.initialize()
+        _assert_raw_evidence_contract(self, self.store)
 
     def test_monitoring_lease_matches_sqlite_semantics(self):
         self.store.initialize()
@@ -309,6 +405,19 @@ class LibSQLForecastStoreIntegrationTests(unittest.TestCase):
                     store._validate_remote_schema(connection)
             finally:
                 connection.rollback()
+
+        with closing(store._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("DROP TABLE observation_raw_evidence")
+                connection.execute("UPDATE schema_migrations SET version=9")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        store.initialize()
+        store.validate_existing()
+        _assert_raw_evidence_contract(self, store)
 
         forecast = _forecast()
         self.assertEqual(store.insert(forecast).status, "inserted")

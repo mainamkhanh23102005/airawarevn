@@ -15,6 +15,7 @@ BASE_URL = "https://api.openaq.org/v3"
 HANOI = ZoneInfo("Asia/Ho_Chi_Minh")
 UTC = timezone.utc
 TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
+MAX_RAW_EVIDENCE_BYTES = 2 * 1024 * 1024
 PROVENANCE_FIELDS = {"endpoint", "sensor_id", "page", "limit", "datetime_from", "datetime_to", "retrieved_at", "http_status", "raw_payload_path", "raw_payload_sha256"}
 
 
@@ -23,7 +24,7 @@ class OpenAQError(RuntimeError):
 
 
 class OpenAQObservationSource:
-    def __init__(self, client, api_key, raw_directory, sleep=time.sleep, now=lambda: datetime.now(UTC), limit=1000, max_pages=100):
+    def __init__(self, client, api_key, raw_directory, sleep=time.sleep, now=lambda: datetime.now(UTC), limit=1000, max_pages=100, evidence_store=None):
         if type(max_pages) is not int or max_pages <= 0:
             raise ValueError("max_pages must be a positive integer")
         self.client = client
@@ -33,6 +34,7 @@ class OpenAQObservationSource:
         self.now = now
         self.limit = limit
         self.max_pages = max_pages
+        self.evidence_store = evidence_store
 
     def acquire(self, sensor_id, start, end):
         from app.ground_truth_reconciler import AcquisitionBatch, SourceParseError, SourceTransportError, normalized_sha256
@@ -41,7 +43,9 @@ class OpenAQObservationSource:
             params = {"datetime_from": start.isoformat(), "datetime_to": end.isoformat(), "limit": self.limit, "page": page}
             try:
                 payload, item = _request(self.client, self.api_key, f"/sensors/{sensor_id}/hours", params,
-                    self.raw_directory, sensor_id, self.sleep, self.now, True)
+                    self.raw_directory, sensor_id, self.sleep, self.now, True, self.evidence_store)
+                if not isinstance(payload, dict):
+                    raise SourceParseError("OpenAQ results is not an object")
                 rows = payload.get("results", [])
                 if not isinstance(rows, list):
                     raise SourceParseError("OpenAQ results is not a list")
@@ -86,26 +90,46 @@ def _cached(raw_directory, request):
             return None
         if any(provenance.get(key) != value for key, value in request.items()):
             return None
-        payload = Path(provenance["raw_payload_path"]).read_bytes()
-        if sha256(payload).hexdigest() != provenance["raw_payload_sha256"]:
+        with Path(provenance["raw_payload_path"]).open("rb") as source:
+            payload = source.read(MAX_RAW_EVIDENCE_BYTES + 1)
+        if len(payload) > MAX_RAW_EVIDENCE_BYTES or sha256(payload).hexdigest() != provenance["raw_payload_sha256"]:
             return None
-        return json.loads(payload), provenance
+        return payload, provenance
     except (OSError, ValueError, TypeError, KeyError):
         return None
 
 
-def _request(client, api_key, path, params, raw_directory, sensor_id=None, sleep=time.sleep, now=lambda: datetime.now(UTC), preserve_decimal=False):
+def _parse_payload(payload, provenance, preserve_decimal, evidence_store):
+    if evidence_store is not None:
+        from app.forecast_ledger import ForecastIntegrityError, LedgerDatabaseError
+        try:
+            evidence_store.insert_raw_evidence(provenance["raw_payload_sha256"], payload)
+        except (ForecastIntegrityError, LedgerDatabaseError):
+            raise
+        except (OSError, ValueError) as error:
+            raise OpenAQError("OpenAQ raw evidence persistence failed") from error
+    try:
+        return json.loads(payload, parse_float=Decimal) if preserve_decimal else json.loads(payload), provenance
+    except ValueError as error:
+        raise OpenAQError("OpenAQ returned invalid JSON") from error
+
+
+def _request(client, api_key, path, params, raw_directory, sensor_id=None, sleep=time.sleep, now=lambda: datetime.now(UTC), preserve_decimal=False, evidence_store=None):
     raw_directory.mkdir(parents=True, exist_ok=True)
     request = {"endpoint": path, "sensor_id": sensor_id, "page": params.get("page"), "limit": params.get("limit"), "datetime_from": params.get("datetime_from"), "datetime_to": params.get("datetime_to")}
     cached = _cached(raw_directory, request)
     if cached:
-        if preserve_decimal:
-            provenance = cached[1]
-            return json.loads(Path(provenance["raw_payload_path"]).read_bytes(), parse_float=Decimal), provenance
-        return cached
+        return _parse_payload(cached[0], cached[1], preserve_decimal, evidence_store)
     for attempt in range(4):
         try:
-            response = client.get(f"{BASE_URL}{path}", params=params, headers={"X-API-Key": api_key})
+            with client.stream("GET", f"{BASE_URL}{path}", params=params, headers={"X-API-Key": api_key}) as response:
+                payload = bytearray()
+                if 200 <= response.status_code < 300:
+                    for chunk in response.iter_bytes():
+                        if len(payload) + len(chunk) > MAX_RAW_EVIDENCE_BYTES:
+                            raise OpenAQError("OpenAQ raw evidence exceeds size limit")
+                        payload.extend(chunk)
+                payload = bytes(payload)
         except httpx.TransportError as error:
             if attempt == 3:
                 raise OpenAQError(f"OpenAQ request failed after retries: {error}") from error
@@ -120,16 +144,12 @@ def _request(client, api_key, path, params, raw_directory, sensor_id=None, sleep
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             raise OpenAQError(f"OpenAQ request failed with HTTP {response.status_code}") from error
-        payload = response.content
         digest = sha256(payload).hexdigest()
         payload_path = raw_directory / f"{_cache_key(request)}-{digest}.json"
         payload_path.write_bytes(payload)
         provenance = {**request, "retrieved_at": now().astimezone(UTC).isoformat(), "http_status": response.status_code, "raw_payload_path": str(payload_path), "raw_payload_sha256": digest}
         (raw_directory / f"{_cache_key(request)}.provenance.json").write_text(json.dumps(provenance, sort_keys=True))
-        try:
-            return json.loads(payload, parse_float=Decimal) if preserve_decimal else json.loads(payload), provenance
-        except ValueError as error:
-            raise OpenAQError("OpenAQ returned invalid JSON") from error
+        return _parse_payload(payload, provenance, preserve_decimal, evidence_store)
     raise OpenAQError("OpenAQ request failed")
 
 

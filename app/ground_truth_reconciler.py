@@ -216,6 +216,9 @@ class GroundTruthReconciler:
             except SourceParseError:
                 results.extend(ReconcileResult("failed", "parse_error", item.forecast_id) for item in plan.forecasts)
                 continue
+            except (ForecastIntegrityError, LedgerDatabaseError):
+                results.extend(ReconcileResult("failed", "database_error", item.forecast_id) for item in plan.forecasts)
+                continue
             target_keys = [(item.sensor_id, item.target_interval_start, item.target_interval_end) for item in plan.forecasts]
             relevant = self.store.forecasts_for_targets(target_keys)
             batches = batch if isinstance(batch, tuple) else (batch,)
