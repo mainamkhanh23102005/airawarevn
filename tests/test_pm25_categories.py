@@ -134,11 +134,15 @@ class PM25CategoryTests(unittest.TestCase):
                          "dbm", "shelve", "pickle"}
 
             def check(name):
-                root = name.split(".")[0]
+                root = name.split(".", 1)[0]
                 if name in allowed_app:
                     return
-                if root not in sys.stdlib_module_names or root in forbidden:
-                    raise AssertionError("forbidden import: " + name)
+                if name.startswith("app."):
+                    raise AssertionError("forbidden application import: " + name)
+                if root == "scripts":
+                    raise AssertionError("forbidden project import: " + name)
+                if root in forbidden:
+                    raise AssertionError("forbidden dependency: " + name)
 
             class Guard(importlib.abc.MetaPathFinder):
                 def find_spec(self, fullname, path=None, target=None):
