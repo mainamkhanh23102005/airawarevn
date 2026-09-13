@@ -17,6 +17,8 @@
     .value { margin: 0; font-size: 2rem; font-weight: 700; }
     .note { margin: .5rem 0 0; color: #4b6155; }
     .change { margin: .5rem 0 0; font-size: 1.05rem; }
+    .category { margin: 0 0 .75rem; font-size: 1.5rem; font-weight: 700; }
+    section { min-width: 0; overflow-wrap: anywhere; }
     .full { grid-column: 1 / -1; }
     #accuracy { color: #4b6155; }
     #accuracy h2 { color: #4b6155; }
@@ -43,14 +45,17 @@
       </section>
 
       <section aria-labelledby="forecast-title">
-        <h2 id="forecast-title">6-hour-ahead forecast</h2>
+        <h2 id="forecast-title">Air Quality Outlook</h2>
+        <p id="outlook-category" class="category">Outlook unavailable.</p>
         <p class="value"><span id="forecast-pm25">—</span> <small>µg/m³</small></p>
         <p id="target-window" class="note">Expected: —</p>
       </section>
 
       <section class="full" aria-labelledby="change-title">
         <h2 id="change-title">Expected change</h2>
-        <p id="expected-change" class="change">No forecast yet.</p>
+        <p id="expected-change" class="change">Outlook unavailable.</p>
+        <p id="outlook-guidance" class="note"></p>
+        <p id="sensitive-guidance" class="note" hidden></p>
       </section>
 
       <section class="full" aria-labelledby="freshness-title">
@@ -121,6 +126,18 @@
         if (Number.isNaN(observed)) {
           return { ok: false, reason: "invalid_history_end" };
         }
+        var outlook = source.outlook == null ? null : source.outlook;
+        if (outlook !== null) {
+          var textFields = ["category", "category_label", "recommendation", "standard_id", "guidance_id", "trend_policy_id"];
+          if (typeof outlook !== "object" || Array.isArray(outlook) ||
+              !textFields.every(function (key) { return typeof outlook[key] === "string" && outlook[key].trim() !== ""; }) ||
+              ["improving", "stable", "worsening"].indexOf(outlook.trend) === -1 ||
+              typeof outlook.change_ug_m3 !== "number" || !Number.isFinite(outlook.change_ug_m3) ||
+              !(outlook.sensitive_group_recommendation === null ||
+                (typeof outlook.sensitive_group_recommendation === "string" && outlook.sensitive_group_recommendation.trim() !== ""))) {
+            return { ok: false, reason: "invalid_outlook" };
+          }
+        }
         var stale = source.freshness_status === "stale";
         var age = finiteValue(source.age_minutes);
         if (!stale && !Number.isFinite(age)) {
@@ -137,20 +154,15 @@
             stale: stale,
             age: Number.isFinite(age) ? age : NaN,
             horizonHours: 6,
+            outlook: outlook,
           },
         };
       }
 
       function changeText(model) {
-        var delta = model.predicted - model.latest;
-        var rounded = Math.abs(delta).toFixed(1);
-        if (parseFloat(rounded) === 0) {
-          return "No meaningful change from the latest reading";
-        }
-        if (delta > 0) {
-          return "↑ About " + rounded + " µg/m³ higher than the latest reading";
-        }
-        return "↓ About " + rounded + " µg/m³ lower than the latest reading";
+        if (!model.outlook) return "Outlook unavailable.";
+        var labels = { improving: "Improving", stable: "Stable", worsening: "Worsening" };
+        return labels[model.outlook.trend] + " · " + Math.abs(model.outlook.change_ug_m3).toFixed(1) + " µg/m³";
       }
 
       function observedText(model) {
@@ -249,6 +261,9 @@
       var forecastValEl = document.querySelector("#forecast-pm25");
       var targetEl = document.querySelector("#target-window");
       var changeEl = document.querySelector("#expected-change");
+      var categoryEl = document.querySelector("#outlook-category");
+      var guidanceEl = document.querySelector("#outlook-guidance");
+      var sensitiveEl = document.querySelector("#sensitive-guidance");
       var freshnessEl = document.querySelector("#freshness");
       var accuracyEl = document.querySelector("#accuracy");
       var accuracySummaryEl = document.querySelector("#accuracy-summary");
@@ -276,6 +291,9 @@
           latest: model.latest.toFixed(1),
           forecast: model.predicted.toFixed(1),
           change: view.changeText(model),
+          category: model.outlook ? model.outlook.category_label : "Outlook unavailable.",
+          guidance: model.outlook ? "General guidance: " + model.outlook.recommendation : "",
+          sensitive: model.outlook ? model.outlook.sensitive_group_recommendation : null,
           observed: view.observedText(model),
           expected: view.expectedText(model),
           freshness: view.freshnessText(model),
@@ -283,6 +301,10 @@
         latestEl.textContent = render.latest;
         forecastValEl.textContent = render.forecast;
         changeEl.textContent = render.change;
+        categoryEl.textContent = render.category;
+        guidanceEl.textContent = render.guidance;
+        sensitiveEl.textContent = render.sensitive === null ? "" : "Sensitive groups: " + render.sensitive;
+        sensitiveEl.hidden = render.sensitive === null;
         observedEl.textContent = render.observed;
         targetEl.textContent = render.expected;
         freshnessEl.textContent = render.freshness;
@@ -302,6 +324,10 @@
           forecastValEl.textContent = "Unavailable";
           targetEl.textContent = "Unavailable";
           changeEl.textContent = "Forecast unavailable right now.";
+          categoryEl.textContent = "Outlook unavailable.";
+          guidanceEl.textContent = "";
+          sensitiveEl.textContent = "";
+          sensitiveEl.hidden = true;
           freshnessEl.textContent = "Unavailable";
           statusEl.textContent = "Forecast unavailable right now.";
         }
