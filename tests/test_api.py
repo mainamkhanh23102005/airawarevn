@@ -290,6 +290,104 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_outlook_real_domain_results_across_forecast_branches(self):
+        self.write_current_pm25_artifact()
+        for branch in ("latest", "current", "stored"):
+            for predicted, trend in ((12.125, "improving"), (24.025, "stable"), (42.5, "worsening")):
+                with self.subTest(branch=branch, predicted=predicted):
+                    with self.client(now=lambda: self.prediction_time) as client:
+                        if branch == "stored":
+                            from dataclasses import replace
+                            from unittest.mock import Mock
+                            record = replace(self.ledger_record(), predicted_pm25=predicted, persistence_prediction=24.0)
+                            client.app.state.forecast_store = Mock(latest=Mock(return_value=record))
+                        with patch("app.main._predict", return_value=predicted):
+                            response = client.get("/forecast/latest" if branch == "latest" else "/forecast/current")
+                    self.assertEqual(response.status_code, 200)
+                    body = response.json()
+                    outlook = body["outlook"]
+                    self.assertEqual(outlook["trend"], trend)
+                    self.assertEqual(outlook["change_ug_m3"], predicted - 24.0)
+                    self.assertEqual(outlook["category"], "good" if predicted <= 25 else "moderate")
+                    self.assertEqual(outlook["category_label"], "Good" if predicted <= 25 else "Moderate")
+                    self.assertEqual(outlook["standard_id"], "vn_1459_2019_pm25_forecast_aligned_v1")
+                    self.assertEqual(outlook["guidance_id"], "airaware_pm25_forecast_guidance_v1")
+                    self.assertEqual(outlook["trend_policy_id"], "airaware_pm25_forecast_trend_v1")
+                    self.assertEqual(outlook["recommendation"], "For the forecast period: outdoor activities can proceed normally.")
+                    self.assertEqual(outlook["sensitive_group_recommendation"], None if predicted <= 25 else "For the forecast period: reduce time outdoors and strenuous activity.")
+                    self.assertEqual(body["latest_completed_pm25"], 24.0)
+                    self.assertEqual(body["predicted_pm25"], predicted)
+                    self.assertEqual(body["forecast_horizon_hours"], 6)
+
+    def test_outlook_invalid_finite_domain_input_returns_whole_null(self):
+        self.write_current_pm25_artifact()
+        for branch in ("latest", "current", "stored"):
+            for predicted, baseline in ((-1.0, 24.0), (42.5, -1.0)):
+                with self.subTest(branch=branch, predicted=predicted, baseline=baseline):
+                    history = [entry.copy() for entry in self.history]
+                    history[-1]["pm25"] = baseline
+                    payload = main.PredictionRequest(**self.payload(history))
+                    with self.client(now=lambda: self.prediction_time) as client:
+                        if branch == "stored":
+                            from dataclasses import replace
+                            from unittest.mock import Mock
+                            client.app.state.forecast_store = Mock(latest=Mock(return_value=replace(
+                                self.ledger_record(), predicted_pm25=predicted, persistence_prediction=baseline)))
+                        with patch("app.main._predict", return_value=predicted), patch(
+                                "app.main._latest_prediction_request", return_value=payload), patch(
+                                "app.main._current_prediction_request", return_value=payload):
+                            response = client.get("/forecast/latest" if branch == "latest" else "/forecast/current")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIsNone(response.json()["outlook"])
+                    self.assertEqual(response.json()["predicted_pm25"], predicted)
+                    self.assertEqual(response.json()["latest_completed_pm25"], baseline)
+
+    def test_outlook_delegates_domain_outputs_and_stored_baseline(self):
+        from app.pm25_categories import PM25Classification, PM25ForecastCategory
+        from app.pm25_recommendations import AirQualityRecommendation
+        from app.pm25_trend import ForecastTrend, PM25Trend
+        from dataclasses import replace
+        from unittest.mock import Mock
+
+        category = PM25ForecastCategory.BAD
+        with self.client(now=lambda: self.prediction_time) as client:
+            client.app.state.forecast_store = Mock(latest=Mock(return_value=replace(
+                self.ledger_record(), persistence_prediction=7.125)))
+            with patch("app.main.classify_pm25_forecast", return_value=PM25Classification(category, "Delegated label", "standard-test")) as classify, patch(
+                    "app.main.recommendation_for_category", return_value=AirQualityRecommendation(category, "Delegated advice", "Delegated sensitive", "guidance-test")) as recommend, patch(
+                    "app.main.calculate_pm25_trend", return_value=PM25Trend(ForecastTrend.IMPROVING, -123.456, "trend-test")) as trend, patch(
+                    "app.main._current_forecast_state", side_effect=AssertionError("must use stored baseline")):
+                response = client.get("/forecast/current")
+        classify.assert_called_once_with(42.5)
+        recommend.assert_called_once_with(category)
+        trend.assert_called_once_with(7.125, 42.5)
+        self.assertEqual(response.json()["outlook"], {
+            "category": "bad", "category_label": "Delegated label", "recommendation": "Delegated advice",
+            "sensitive_group_recommendation": "Delegated sensitive", "trend": "improving",
+            "change_ug_m3": -123.456, "standard_id": "standard-test", "guidance_id": "guidance-test",
+            "trend_policy_id": "trend-test"})
+
+    def test_outlook_only_expected_domain_errors_are_nullable(self):
+        for function in ("classify_pm25_forecast", "recommendation_for_category", "calculate_pm25_trend"):
+            for error_type in (TypeError, ValueError, RuntimeError):
+                with self.subTest(function=function, error=error_type):
+                    with self.client() as client, patch("app.main." + function, side_effect=error_type("private failure")):
+                        if error_type is RuntimeError:
+                            with self.assertRaises(RuntimeError):
+                                client.get("/forecast/latest")
+                        else:
+                            response = client.get("/forecast/latest")
+                            self.assertEqual(response.status_code, 200)
+                            self.assertIsNone(response.json()["outlook"])
+                            self.assertNotIn("private failure", response.text)
+
+    def test_outlook_schema_is_nullable_only_on_forecast_hierarchy(self):
+        schemas = create_app(self.artifact_path).openapi()["components"]["schemas"]
+        for name in ("LatestForecastResponse", "CurrentForecastResponse"):
+            self.assertIn({"type": "null"}, schemas[name]["properties"]["outlook"]["anyOf"])
+        self.assertNotIn("outlook", schemas["PredictionResponse"]["properties"])
+        self.assertNotIn("outlook", schemas["StatusResponse"]["properties"])
+
     def test_latest_forecast_uses_latest_contiguous_completed_history(self):
         with self.client() as client:
             response = client.get("/forecast/latest")
@@ -525,7 +623,8 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(response.headers["content-type"].startswith("text/html"))
         self.assertIn("AirAware VN", response.text)
         self.assertIn("Latest PM2.5", response.text)
-        self.assertIn("6-hour-ahead forecast", response.text)
+        self.assertIn('<h2 id="forecast-title">Air Quality Outlook</h2>', response.text)
+        self.assertIn("Live 6-hour PM2.5 forecast for Hanoi.", response.text)
         self.assertIn("Expected change", response.text)
         self.assertIn("Data freshness", response.text)
         self.assertIn("Refresh forecast", response.text)
@@ -572,9 +671,13 @@ class ApiTests(unittest.TestCase):
         with self.client() as client:
             response = client.get("/")
 
-        self.assertIn("higher than the latest reading", response.text)
-        self.assertIn("lower than the latest reading", response.text)
-        self.assertIn("No meaningful change from the latest reading", response.text)
+        self.assertIn("Worsening", response.text)
+        self.assertIn("Improving", response.text)
+        self.assertIn("Stable", response.text)
+        self.assertNotIn("model.predicted - model.latest", response.text)
+        self.assertIn('id="outlook-category"', response.text)
+        self.assertIn('id="sensitive-guidance" class="note" hidden', response.text)
+        self.assertNotIn("innerHTML", response.text)
         self.assertIn(".toFixed(1)", response.text)
         self.assertNotIn("exact", response.text)
 
@@ -710,9 +813,9 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
   out.expected = V.expectedText({ start: Date.parse("2025-02-02T06:00:00Z"), end: Date.parse("2025-02-02T07:00:00Z") });
   out.observed = V.observedText({ observed: Date.parse("2025-02-02T00:00:00Z") });
   out.horizon = V.HORIZON_HOURS;
-  out.changeHigher = V.changeText({ latest: 10, predicted: 15 });
-  out.changeLower = V.changeText({ latest: 15, predicted: 10 });
-  out.changeNone = V.changeText({ latest: 10, predicted: 10 });
+   out.changeHigher = V.changeText({ latest: 100, predicted: 1, outlook: { trend: "worsening", change_ug_m3: 0.049 } });
+   out.changeLower = V.changeText({ latest: 1, predicted: 100, outlook: { trend: "improving", change_ug_m3: -7.26 } });
+   out.changeNone = V.changeText({ latest: 1, predicted: 100, outlook: { trend: "stable", change_ug_m3: 0 } });
   {
     const sb = await build([ok(VALID)], [err()]);
     out.validWhole = { latest: sb.els["#latest-pm25"].textContent, forecast: sb.els["#forecast-pm25"].textContent,
@@ -783,7 +886,52 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
       malformedContent: malformed.els["#accuracy-explanation"].textContent + malformed.els["#accuracy-comparison"].textContent + malformed.els["#accuracy-evidence"].textContent,
       forecastUnaffected: failed.els["#forecast-pm25"].textContent };
   }
-  console.log(JSON.stringify(out));
+   const outlook = { category: "unhealthy", category_label: "Backend label <b>literal</b>",
+     recommendation: "Backend guidance <script>literal</script>", sensitive_group_recommendation: "Backend sensitive guidance",
+     trend: "worsening", change_ug_m3: 0.049, standard_id: "standard", guidance_id: "guidance", trend_policy_id: "policy" };
+   const populated = { ...VALID, latest_completed_pm25: 100, predicted_pm25: 1, outlook };
+   function snapshot(sb) {
+     const ids = ["latest-pm25", "forecast-pm25", "observed-time", "target-window", "expected-change", "outlook-category", "outlook-guidance", "sensitive-guidance"];
+     return Object.fromEntries(ids.map(id => [id, sb.els["#" + id]?.textContent]));
+   }
+   {
+     const sb = await build([ok(populated), ok({ ...populated, outlook: { ...outlook, sensitive_group_recommendation: null } }),
+       ok({ ...VALID, outlook: null }), ok(VALID), ok({ ...populated, freshness_status: "stale" }), err(), ok(populated)], [ok(PERFORMANCE)]);
+     out.outlook = snapshot(sb);
+     out.sensitiveVisible = sb.els["#sensitive-guidance"]?.hidden === false;
+     await sb.AirAwareDom.loadForecast();
+     out.sensitiveCleared = { text: sb.els["#sensitive-guidance"]?.textContent, hidden: sb.els["#sensitive-guidance"]?.hidden };
+     out.absentOutlooks = [];
+     for (let i = 0; i < 2; i++) {
+       await sb.AirAwareDom.loadForecast();
+       out.absentOutlooks.push({ ...snapshot(sb), hidden: sb.els["#sensitive-guidance"]?.hidden, status: sb.els["#status"].textContent });
+     }
+     await sb.AirAwareDom.loadForecast();
+     out.staleOutlook = { ...snapshot(sb), freshness: sb.els["#freshness"].textContent };
+     await sb.AirAwareDom.loadForecast();
+     out.errorOutlook = { ...snapshot(sb), freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent };
+     await sb.AirAwareDom.loadForecast();
+     out.recoveredOutlook = { ...snapshot(sb), freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
+       accuracy: sb.els["#accuracy-summary"].textContent };
+   }
+   out.malformedOutlooks = [];
+   const malformedOutlooks = [false, "bad", [], {}, ...Object.keys(outlook).filter(k => k !== "sensitive_group_recommendation").flatMap(k =>
+     [{ ...outlook, [k]: null }, { ...outlook, [k]: undefined }]),
+     { ...outlook, trend: "sideways" }, { ...outlook, change_ug_m3: "0.049" },
+     { ...outlook, change_ug_m3: Infinity }, { ...outlook, change_ug_m3: NaN },
+     { ...outlook, category_label: " " }, { ...outlook, recommendation: {} },
+     { ...outlook, sensitive_group_recommendation: 5 }, { ...outlook, sensitive_group_recommendation: undefined }];
+   for (const malformed of malformedOutlooks) {
+     const sb = await build([ok(populated), ok({ ...VALID, outlook: malformed })]);
+     const before = snapshot(sb);
+     await sb.AirAwareDom.loadForecast();
+     out.malformedOutlooks.push({ rejected: !V.buildModel({ ...VALID, outlook: malformed }).ok,
+       preserved: JSON.stringify(before) === JSON.stringify(snapshot(sb)),
+       sensitiveVisible: sb.els["#sensitive-guidance"]?.hidden === false,
+       freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
+       busy: sb.els["#forecast"].attrs["aria-busy"] });
+   }
+   console.log(JSON.stringify(out));
 })();
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -798,6 +946,7 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
                 ["node", str(harness_path), str(pure_path), str(dom_path)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=True,
             )
         return json.loads(result.stdout)
@@ -917,9 +1066,46 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
 
     def test_view_model_change_labels(self):
         behaviors = self.node_behaviors()
-        self.assertIn("higher than the latest reading", behaviors["changeHigher"])
-        self.assertIn("lower than the latest reading", behaviors["changeLower"])
-        self.assertIn("No meaningful change from the latest reading", behaviors["changeNone"])
+        self.assertEqual(behaviors["changeHigher"], "Worsening · 0.0 µg/m³")
+        self.assertEqual(behaviors["changeLower"], "Improving · 7.3 µg/m³")
+        self.assertEqual(behaviors["changeNone"], "Stable · 0.0 µg/m³")
+
+    def test_outlook_authority_sensitive_and_unavailable_transitions(self):
+        behaviors = self.node_behaviors()
+        outlook = behaviors["outlook"]
+        self.assertEqual(outlook["forecast-pm25"], "1.0")
+        self.assertEqual(outlook["outlook-category"], "Backend label <b>literal</b>")
+        self.assertEqual(outlook["outlook-guidance"], "General guidance: Backend guidance <script>literal</script>")
+        self.assertEqual(outlook["expected-change"], "Worsening · 0.0 µg/m³")
+        self.assertEqual(outlook["sensitive-guidance"], "Sensitive groups: Backend sensitive guidance")
+        self.assertTrue(behaviors["sensitiveVisible"])
+        self.assertEqual(behaviors["sensitiveCleared"], {"text": "", "hidden": True})
+        for absent in behaviors["absentOutlooks"]:
+            self.assertEqual(absent["forecast-pm25"], "42.5")
+            self.assertEqual(absent["outlook-category"], "Outlook unavailable.")
+            self.assertEqual(absent["expected-change"], "Outlook unavailable.")
+            self.assertEqual(absent["outlook-guidance"], "")
+            self.assertEqual(absent["sensitive-guidance"], "")
+            self.assertTrue(absent["hidden"])
+            self.assertEqual(absent["status"], "Forecast updated.")
+
+    def test_outlook_malformed_is_atomic_and_stale_error_recover(self):
+        behaviors = self.node_behaviors()
+        for malformed in behaviors["malformedOutlooks"]:
+            self.assertTrue(malformed["rejected"])
+            self.assertTrue(malformed["preserved"])
+            self.assertTrue(malformed["sensitiveVisible"])
+            self.assertEqual(malformed["freshness"], "Data may be out of date.")
+            self.assertIn("most recent forecast", malformed["status"])
+            self.assertEqual(malformed["busy"], "false")
+        for name in ("staleOutlook", "errorOutlook", "recoveredOutlook"):
+            for key, value in behaviors["outlook"].items():
+                self.assertEqual(behaviors[name][key], value)
+        self.assertEqual(behaviors["staleOutlook"]["freshness"], "Data may be out of date.")
+        self.assertIn("most recent forecast", behaviors["errorOutlook"]["status"])
+        self.assertEqual(behaviors["recoveredOutlook"]["freshness"], "Updated 0 minutes ago")
+        self.assertEqual(behaviors["recoveredOutlook"]["status"], "Forecast updated.")
+        self.assertIn("3.2 µg/m³", behaviors["recoveredOutlook"]["accuracy"])
 
     def ledger_record(self):
         return ForecastRecord.create(sensor_id=13502151, prediction_time=self.prediction_time,
@@ -935,7 +1121,7 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
         self.write_current_pm25_artifact()
         with self.client(now=lambda: self.prediction_time) as client:
             body = client.get("/forecast/current").json()
-        self.assertEqual(set(body), {"prediction_time", "target_interval_start", "target_interval_end", "forecast_horizon_hours", "predicted_pm25", "unit", "model_version", "latest_completed_pm25", "history_start", "history_end", "data_mode", "source_retrieved_at", "sensor_id", "freshness_status", "age_minutes"})
+        self.assertEqual(set(body), {"prediction_time", "target_interval_start", "target_interval_end", "forecast_horizon_hours", "predicted_pm25", "unit", "model_version", "latest_completed_pm25", "history_start", "history_end", "data_mode", "source_retrieved_at", "sensor_id", "freshness_status", "age_minutes", "outlook"})
 
     def test_enabled_current_reads_issued_record_without_source_or_prediction(self):
         database = Path(self.directory.name) / "ledger.sqlite3"

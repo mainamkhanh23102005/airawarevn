@@ -15,6 +15,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.forecast_ledger import LedgerDatabaseError, create_forecast_store, feature_schema_sha256, sha256_file
+from app.pm25_categories import PM25ForecastCategory, classify_pm25_forecast
+from app.pm25_recommendations import recommendation_for_category
+from app.pm25_trend import ForecastTrend, calculate_pm25_trend
 from scripts.modeling.features import (
     FORECAST_HORIZON_HOURS,
     V1_FEATURE_COLUMNS,
@@ -95,11 +98,24 @@ class PredictionResponse(BaseModel):
     model_version: str
 
 
+class AirQualityOutlookResponse(BaseModel):
+    category: PM25ForecastCategory
+    category_label: str
+    recommendation: str
+    sensitive_group_recommendation: str | None
+    trend: ForecastTrend
+    change_ug_m3: Annotated[float, Field(allow_inf_nan=False)]
+    standard_id: str
+    guidance_id: str
+    trend_policy_id: str
+
+
 class LatestForecastResponse(PredictionResponse):
     latest_completed_pm25: float
     history_start: datetime
     history_end: datetime
     data_mode: str
+    outlook: AirQualityOutlookResponse | None = None
 
 
 class CurrentForecastResponse(LatestForecastResponse):
@@ -344,6 +360,27 @@ def _predict(model, metadata, payload):
     return predicted_pm25
 
 
+def _build_outlook(current_pm25, predicted_pm25):
+    try:
+        classification = classify_pm25_forecast(predicted_pm25)
+        recommendation = recommendation_for_category(classification.category)
+        trend = calculate_pm25_trend(current_pm25, predicted_pm25)
+    except (TypeError, ValueError):
+        logger.exception("Air quality outlook unavailable")
+        return None
+    return AirQualityOutlookResponse(
+        category=classification.category,
+        category_label=classification.label,
+        recommendation=recommendation.message,
+        sensitive_group_recommendation=recommendation.sensitive_group_message,
+        trend=trend.trend,
+        change_ug_m3=trend.change_ug_m3,
+        standard_id=classification.standard_id,
+        guidance_id=recommendation.guidance_id,
+        trend_policy_id=trend.policy_id,
+    )
+
+
 def _current_forecast_state(model, metadata, artifact_path, current_time):
     artifact, retrieved_at = _load_current_artifact(artifact_path)
     payload = _current_prediction_request(artifact, current_time)
@@ -572,6 +609,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
             unit="µg/m³",
             model_version=MODEL_VERSION,
             latest_completed_pm25=payload.history[-1].pm25,
+            outlook=_build_outlook(payload.history[-1].pm25, predicted_pm25),
             history_start=payload.history[0].event_time,
             history_end=payload.history[-1].event_time,
             data_mode="historical_artifact",
@@ -594,6 +632,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
                 prediction_time=record.prediction_time, target_interval_start=record.target_interval_start,
                 target_interval_end=record.target_interval_end, forecast_horizon_hours=record.forecast_horizon_hours,
                 predicted_pm25=record.predicted_pm25, unit=record.unit, model_version=record.model_version,
+                outlook=_build_outlook(record.persistence_prediction, record.predicted_pm25),
                 latest_completed_pm25=record.persistence_prediction, history_start=record.history_start,
                 history_end=record.history_end, data_mode="stale_openaq" if is_stale else "fresh_openaq",
                 source_retrieved_at=record.source_retrieved_at, sensor_id=record.sensor_id,
@@ -620,6 +659,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
             unit="µg/m³",
             model_version=MODEL_VERSION,
             latest_completed_pm25=payload.history[-1].pm25,
+            outlook=_build_outlook(payload.history[-1].pm25, predicted_pm25),
             history_start=payload.history[0].event_time,
             history_end=payload.history[-1].event_time,
             data_mode="stale_openaq" if is_stale else "fresh_openaq",
