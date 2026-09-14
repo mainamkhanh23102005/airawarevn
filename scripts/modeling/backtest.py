@@ -169,6 +169,45 @@ def calculate_metrics(actual, predicted):
     return calculate_error_metrics(actual, predicted)
 
 
+@dataclass(frozen=True)
+class BaselineComparison:
+    ml_mae: float | None
+    baseline_mae: float | None
+    improvement_percent: float | None
+    evaluated_forecast_count: int
+
+
+def compare_baseline(predictions, ml_model_name):
+    if ml_model_name == "persistence":
+        raise ValueError("ML model must differ from persistence")
+    keys = ["fold", "timestamp"]
+    values = ["actual_pm25", "predicted_pm25"]
+    required = [*keys, "model", *values]
+    missing = [column for column in required if column not in predictions.columns]
+    if missing:
+        raise ValueError(f"missing required prediction columns: {missing}")
+    cohorts = []
+    for name in (ml_model_name, "persistence"):
+        cohort = predictions.loc[predictions["model"] == name, keys + values]
+        if cohort[keys].isna().any().any() or cohort.duplicated(keys).any():
+            raise ValueError(f"{name} requires unique nonmissing (fold, timestamp) keys")
+        if not np.isfinite(cohort[values].to_numpy(dtype=float)).all():
+            raise ValueError(f"{name} predictions and actual targets must be finite")
+        cohorts.append(cohort.set_index(keys))
+    ml, baseline = cohorts
+    if len(ml) != len(baseline) or not ml.index.isin(baseline.index).all():
+        raise ValueError("ML and persistence must have identical (fold, timestamp) keys")
+    baseline = baseline.reindex(ml.index)
+    if not np.array_equal(ml["actual_pm25"].to_numpy(), baseline["actual_pm25"].to_numpy()):
+        raise ValueError("ML and persistence must have identical actual targets")
+    if ml.empty:
+        return BaselineComparison(None, None, None, 0)
+    ml_mae = calculate_error_metrics(ml["actual_pm25"], ml["predicted_pm25"]).mae
+    baseline_mae = calculate_error_metrics(baseline["actual_pm25"], baseline["predicted_pm25"]).mae
+    improvement = (baseline_mae - ml_mae) / baseline_mae * 100 if baseline_mae else None
+    return BaselineComparison(ml_mae, baseline_mae, improvement, len(ml))
+
+
 def _predict(model_name, factory, feature_columns, training, validation):
     if factory is None:
         if "pm25_lag_1h" not in validation:

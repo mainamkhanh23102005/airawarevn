@@ -222,5 +222,116 @@ class BacktestUnitTests(unittest.TestCase):
         self.assertTrue(featured[V1_FEATURE_COLUMNS + [TARGET_COLUMN]].isna().any().any())
 
 
+class BaselineComparisonTests(unittest.TestCase):
+    def records(self, ml=11.0, baseline=12.0):
+        return pd.DataFrame([
+            {"fold": "2026-02", "timestamp": pd.Timestamp("2026-02-01", tz="UTC"),
+             "model": model, "actual_pm25": 10.0, "predicted_pm25": value}
+            for model, value in [("linear_regression", ml), ("persistence", baseline)]
+        ])
+
+    def compare(self, records):
+        from scripts.modeling.backtest import compare_baseline
+        return compare_baseline(records, "linear_regression")
+
+    def test_metrics_better_equal_worse_empty_and_zero(self):
+        for ml, baseline, percentage in [(11, 12, 50), (12, 12, 0), (14, 12, -100), (11, 10, None), (10, 10, None)]:
+            with self.subTest(ml=ml, baseline=baseline):
+                result = self.compare(self.records(ml, baseline))
+                self.assertEqual(result.ml_mae, abs(ml - 10))
+                self.assertEqual(result.baseline_mae, abs(baseline - 10))
+                self.assertEqual(result.improvement_percent, percentage)
+                self.assertEqual(result.evaluated_forecast_count, 1)
+        result = self.compare(self.records().iloc[:0])
+        self.assertEqual(result.evaluated_forecast_count, 0)
+        self.assertIsNone(result.ml_mae)
+        self.assertIsNone(result.baseline_mae)
+        self.assertIsNone(result.improvement_percent)
+
+    def test_pairing_by_unique_fold_timestamp_not_order(self):
+        first = self.records()
+        second = self.records(14, 12).assign(fold="2026-03")
+        records = pd.concat([first, second], ignore_index=True).iloc[::-1]
+        result = self.compare(records)
+        self.assertEqual(result.evaluated_forecast_count, 2)
+        self.assertEqual(result.ml_mae, 2.5)
+        self.assertEqual(result.improvement_percent, -25)
+        with patch("scripts.modeling.backtest.calculate_error_metrics", wraps=calculate_error_metrics) as metrics:
+            self.compare(records)
+        self.assertEqual(metrics.call_count, 2)
+
+    def test_rejects_missing_extra_duplicate_keys_and_different_truth(self):
+        records = self.records()
+        invalid = [records.iloc[:1], records.iloc[1:], pd.concat([records, records.iloc[:1]]), pd.concat([records, records.iloc[1:]])]
+        for column, value in [("fold", "2026-03"), ("timestamp", pd.Timestamp("2026-02-02", tz="UTC")), ("actual_pm25", 10.000000001), ("fold", None), ("timestamp", pd.NaT)]:
+            changed = records.copy()
+            changed.loc[1, column] = value
+            invalid.append(changed)
+        for changed in invalid:
+            with self.subTest(records=changed), self.assertRaises(ValueError):
+                self.compare(changed)
+
+    def test_rejects_nonfinite_predictions_and_targets_for_either_model(self):
+        for row in (0, 1):
+            for column in ("actual_pm25", "predicted_pm25"):
+                for value in (float("nan"), float("inf"), -float("inf")):
+                    records = self.records()
+                    records.loc[row, column] = value
+                    with self.subTest(row=row, column=column, value=value), self.assertRaises(ValueError):
+                        self.compare(records)
+
+    def test_synthetic_cohorts_persistence_and_strict_chronology(self):
+        times = pd.date_range("2025-08-01", "2026-07-02", freq="h", tz="UTC")
+        raw = pd.DataFrame({"event_time": times, "pm25": [float(i % 97) for i in range(len(times))]})
+        missing_time = pd.Timestamp("2026-03-10", tz="UTC")
+        raw.loc[raw.event_time == missing_time, "pm25"] = float("nan")
+        with patch("scripts.modeling.train_cli.load_frozen_pm25_dataframe", return_value=raw):
+            data = build_modeling_dataframe(Path("synthetic.json"))
+        self.assertNotIn(missing_time + pd.Timedelta(hours=2), set(data.event_time))
+        report = evaluate_walk_forward(data, model_factories={"linear_regression": LinearRegression, "persistence": None})
+        result = self.compare(report.predictions)
+        self.assertEqual(result.evaluated_forecast_count, report.total_oof_count)
+        indexed = raw.set_index("event_time").pm25
+        baseline = report.predictions.query("model == 'persistence'")
+        self.assertEqual(baseline.predicted_pm25.tolist(), indexed.reindex(baseline.timestamp - pd.Timedelta(hours=1)).tolist())
+        self.assertEqual(baseline.actual_pm25.tolist(), indexed.reindex(baseline.timestamp + pd.Timedelta(hours=6)).tolist())
+        self.assertTrue((baseline.predicted_pm25.to_numpy() != indexed.reindex(baseline.timestamp).to_numpy()).any())
+        folds, reserved = create_walk_forward_folds(data)
+        self.assertEqual(tuple(fold.name for fold in folds), VALIDATION_MONTHS)
+        previous = 0
+        for fold in folds:
+            self.assertGreater(len(fold.training), previous)
+            self.assertTrue(fold.training.event_time.is_monotonic_increasing)
+            self.assertTrue(((fold.training.event_time + pd.Timedelta(hours=6)) < fold.validation_start).all())
+            self.assertEqual(fold.purged_boundary_count, 6)
+            self.assertTrue((fold.validation.event_time >= fold.validation_start).all())
+            self.assertTrue((fold.validation.event_time < fold.validation_end).all())
+            previous = len(fold.training)
+        self.assertTrue((baseline.timestamp < reserved.start).all())
+        origin = pd.Timestamp("2026-04-10", tz="UTC")
+        changed = raw.copy()
+        changed.loc[changed.event_time >= origin, "pm25"] = 9999.0
+        before = build_v1_features(raw, include_target=True).set_index("event_time")
+        after = build_v1_features(changed, include_target=True).set_index("event_time")
+        pd.testing.assert_series_equal(before.loc[origin, V1_FEATURE_COLUMNS], after.loc[origin, V1_FEATURE_COLUMNS])
+        self.assertNotEqual(before.loc[origin, TARGET_COLUMN], after.loc[origin, TARGET_COLUMN])
+
+    def test_cli_fixed_a2_configuration_and_visible_verdicts(self):
+        from types import SimpleNamespace
+        for ml, baseline, percentage, verdict in [(14, 12, "-100.0000%", "worse"), (11, 12, "50.0000%", "better"), (12, 12, "0.0000%", "equal"), (11, 10, "unavailable", "worse"), (10, 10, "unavailable", "equal")]:
+            stdout = io.StringIO()
+            data = pd.DataFrame()
+            with patch("scripts.modeling.ablation.build_modeling_dataframe", return_value=data) as build, patch("scripts.modeling.ablation.evaluate_walk_forward", return_value=SimpleNamespace(predictions=self.records(ml, baseline))) as evaluate, patch("scripts.modeling.ablation.run_feature_ablation") as ablate, patch("sys.stdout", stdout):
+                ablation_main(["--baseline-comparison", "--input", "synthetic.json"])
+            build.assert_called_once_with(Path("synthetic.json"))
+            self.assertIs(evaluate.call_args.args[0], data)
+            self.assertEqual(evaluate.call_args.kwargs["feature_columns"], ABLATION_FEATURE_COLUMNS["A2"])
+            self.assertEqual(evaluate.call_args.kwargs["model_factories"], {"linear_regression": LinearRegression, "persistence": None})
+            ablate.assert_not_called()
+            output = stdout.getvalue()
+            for text in ("ml_mae=", "baseline_mae=", "improvement_percent=" + percentage, "evaluated_forecast_count=1", "verdict=" + verdict, "pm25_lag_1h", "latest completed hour", "t+6h", "2025-08", "2026-02", "2026-06", "2026-07", "Asia/Ho_Chi_Minh", "strict", "pooled", "A2"):
+                self.assertIn(text, output)
+
+
 if __name__ == "__main__":
     unittest.main()
