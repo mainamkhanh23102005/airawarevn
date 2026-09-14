@@ -333,16 +333,36 @@ def evaluate_stage0_gates(structural, numeric):
     return Stage0GateEvaluation(False, value is not None and value >= threshold - 5)
 
 
+def parse_candidate_timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("candidate timestamp must be ISO 8601") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError("candidate timestamp must include timezone")
+    return parsed.astimezone(UTC)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("discovery")
     coverage_parser = subparsers.add_parser("coverage")
     coverage_parser.add_argument("--sensor-id", required=True, type=int)
+    coverage_parser.add_argument("--candidate-start", type=parse_candidate_timestamp, help="Explicit timezone-aware ISO 8601 candidate start (inclusive); pair with --candidate-end.")
+    coverage_parser.add_argument("--candidate-end", type=parse_candidate_timestamp, help="Explicit timezone-aware ISO 8601 candidate end (exclusive); twelve Hanoi calendar months.")
     weather_parser = subparsers.add_parser("weather")
     weather_parser.add_argument("--sensor-id", required=True, type=int)
     weather_parser.add_argument("--pm25-normalized-path", required=True)
     args = parser.parse_args(argv)
+    candidate_options = {}
+    if args.command == "coverage":
+        if (args.candidate_start is None) != (args.candidate_end is None):
+            parser.error("--candidate-start and --candidate-end must be supplied together")
+        if args.candidate_start is not None:
+            if args.candidate_end <= args.candidate_start:
+                parser.error("candidate end must be after start")
+            candidate_options = {"candidate_start": args.candidate_start, "candidate_end": args.candidate_end}
     import os
     from pathlib import Path
 
@@ -371,13 +391,19 @@ def main(argv=None):
             raise openaq.OpenAQError(f"Sensor {args.sensor_id} not found in Hanoi discovery")
         sensor = openaq.enrich_sensor_metadata(client, api_key, sensor, raw_directory)
         records, provenance = [], []
-        for chunk_start, chunk_end in openaq.sensor_history_chunks(sensor):
+        chunks = openaq.sensor_history_chunks(sensor)
+        if candidate_options:
+            if not chunks:
+                raise openaq.OpenAQError("Unsupported source bounds")
+            openaq.explicit_candidate_interval(args.candidate_start, args.candidate_end, chunks[0][0], chunks[-1][1])
+            chunks = openaq.hanoi_month_chunks(args.candidate_start, args.candidate_end)
+        for chunk_start, chunk_end in chunks:
             rows, pages = openaq.fetch_hours(client, api_key, args.sensor_id, chunk_start, chunk_end, raw_directory)
             records.extend(rows)
             provenance.extend(pages)
     artifact_directory.mkdir(parents=True, exist_ok=True)
     (artifact_directory / "openaq_provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
-    openaq.write_coverage_artifacts(records, sensor, artifact_directory / "coverage")
+    openaq.write_coverage_artifacts(records, sensor, artifact_directory / "coverage", **candidate_options)
 
 
 if __name__ == "__main__":

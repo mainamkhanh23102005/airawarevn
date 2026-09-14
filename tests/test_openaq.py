@@ -371,6 +371,60 @@ class EvidenceTests(unittest.TestCase):
         store.insert_raw_evidence.assert_not_called()
 
 
+class ExplicitCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.start = datetime(2025, 7, 31, 17, tzinfo=UTC)
+        self.end = datetime(2026, 7, 31, 17, tzinfo=UTC)
+        self.metadata = {"sensor_id": 13502151, "datetimeFirst": {"utc": "2025-01-01T00:00:00Z"}, "datetimeLast": {"utc": "2026-09-01T00:00:00Z"}}
+        times = [self.start - timedelta(hours=1), self.start, self.end]
+        times += [datetime(2025 + (month < 8), month, 15, tzinfo=UTC) for month in range(1, 13)]
+        times += [datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 31, 16, tzinfo=UTC)]
+        self.records = [{"sensor_id": 13502151, "event_time": time, "period_end_utc": time + timedelta(hours=1), "value": 10, "unit": "µg/m³", "record_id": index} for index, time in enumerate(sorted(times))]
+
+    def test_historical_metadata_filename_end_exclusive_no_interpolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = openaq.write_coverage_artifacts(self.records, self.metadata, Path(directory), output=io.StringIO(), candidate_start=self.start, candidate_end=self.end)
+            artifact = json.loads(paths["normalized_path"].read_text())
+            report = json.loads(paths["coverage_path"].read_text())
+        self.assertEqual(paths["normalized_path"].name, "openaq_normalized_sensor_13502151_20250731T170000+0000.json")
+        self.assertEqual(artifact["sensor_metadata"], self.metadata)
+        self.assertEqual(artifact["frozen_candidate"], {"start_utc": self.start.isoformat(), "end_utc": self.end.isoformat()})
+        expected = [row for row in self.records if self.start <= row["event_time"] < self.end]
+        self.assertEqual([row["record_id"] for row in artifact["normalized_records"]], [row["record_id"] for row in expected])
+        self.assertEqual(report["coverage"]["expected_hours"], 8760)
+        self.assertEqual(report["coverage"]["observed_unique_hours"], len(expected))
+        self.assertEqual(report["overall_status"], "FAIL")
+        self.assertEqual(report["frozen_candidate"], artifact["frozen_candidate"])
+
+    def test_default_still_selects_latest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = json.loads(openaq.write_coverage_report(self.records, Path(directory)).read_text())
+        self.assertEqual(report["frozen_candidate"], {"start_utc": "2025-08-31T17:00:00+00:00", "end_utc": "2026-08-31T17:00:00+00:00"})
+
+    def test_rejects_outside_source_and_unsupported_calendar_bounds(self):
+        cases = [(self.start - timedelta(days=365), self.end - timedelta(days=365)),
+                 (self.start + timedelta(days=365), self.end + timedelta(days=365)),
+                 (self.start + timedelta(hours=1), self.end),
+                 (self.start, self.end - timedelta(hours=1)),
+                 (self.start, self.end - timedelta(days=31))]
+        for start, end in cases:
+            with self.subTest(start=start, end=end), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(openaq.OpenAQError):
+                    openaq.write_coverage_artifacts(self.records, self.metadata, Path(directory), output=io.StringIO(), candidate_start=start, candidate_end=end)
+
+    def test_cli_explicit_fetches_only_requested_hanoi_chunks_default_keeps_history(self):
+        from scripts import run_data_spike as spike
+        for explicit in (False, True):
+            options = ["--candidate-start", self.start.isoformat(), "--candidate-end", self.end.isoformat()] if explicit else []
+            with self.subTest(explicit=explicit), patch.dict(os.environ, {"OPENAQ_API_KEY": "test"}), patch.object(openaq, "discover", return_value=[self.metadata]), patch.object(openaq, "enrich_sensor_metadata", return_value=self.metadata), patch.object(openaq, "fetch_hours", return_value=([], [])) as fetch, patch.object(openaq, "write_coverage_artifacts") as write, patch.object(Path, "mkdir"), patch.object(Path, "write_text"):
+                spike.main(["coverage", "--sensor-id", "13502151", *options])
+            expected = openaq.hanoi_month_chunks(self.start, self.end) if explicit else openaq.sensor_history_chunks(self.metadata)
+            self.assertEqual([(call.args[3], call.args[4]) for call in fetch.call_args_list], expected)
+            if explicit:
+                self.assertEqual(write.call_args.kwargs["candidate_start"], self.start)
+                self.assertEqual(write.call_args.kwargs["candidate_end"], self.end)
+
+
 class CoverageTests(unittest.TestCase):
     def test_sensor_metadata_enriches_compact_discovery_sensor_for_arbitrary_id(self):
         compact = {"sensor_id": 24680, "parameter_name": "pm25", "datetimeFirst": None, "datetimeLast": None}
