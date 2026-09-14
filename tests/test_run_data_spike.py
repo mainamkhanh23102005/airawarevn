@@ -179,6 +179,34 @@ class CandidatePeriodSelectionTests(unittest.TestCase):
         self.assertEqual(metrics["end_utc"], frozen.end_utc)
 
 
+class ExplicitCandidateTests(unittest.TestCase):
+    def test_aware_iso_normalizes_to_utc(self):
+        self.assertEqual(spike.parse_candidate_timestamp("2025-08-01T00:00:00+07:00"), utc_hour(2025, 7, 31, 17))
+        self.assertEqual(spike.parse_candidate_timestamp("2025-07-31T17:00:00Z"), utc_hour(2025, 7, 31, 17))
+
+    def test_cli_rejects_invalid_pairs_before_network(self):
+        import argparse
+        import io
+        from unittest.mock import patch
+        start, end = "2025-07-31T17:00:00+00:00", "2026-07-31T17:00:00+00:00"
+        cases = [(["--candidate-start", start], "together"),
+                 (["--candidate-end", end], "together")]
+        for left, right, message in [("bad", end, "ISO"), (start, "bad", "ISO"),
+                ("2025-07-31T17:00:00", end, "timezone"),
+                (start, "2026-07-31T17:00:00", "timezone"),
+                (start, start, "after"), (end, start, "after")]:
+            cases.append((["--candidate-start", left, "--candidate-end", right], message))
+        for options, message in cases:
+            with self.subTest(options=options), patch("sys.stderr", new_callable=io.StringIO) as stderr, patch("scripts.openaq.discover") as discover:
+                with self.assertRaises(SystemExit) as raised:
+                    spike.main(["coverage", "--sensor-id", "13502151", *options])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, stderr.getvalue())
+                discover.assert_not_called()
+        with self.assertRaises(argparse.ArgumentTypeError):
+            spike.parse_candidate_timestamp("bad")
+
+
 class ExpectedHourlyGridTests(unittest.TestCase):
     def test_half_open_expected_hour_counts(self):
         self.assertEqual(spike.expected_hourly_grid(utc_hour(2024, 1, 1), utc_hour(2024, 1, 1, 1)), [utc_hour(2024, 1, 1)])

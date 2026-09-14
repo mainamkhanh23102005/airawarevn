@@ -262,9 +262,35 @@ def sensor_history_chunks(metadata):
     return hanoi_month_chunks(_parse_utc(first), _parse_utc(last))
 
 
-def write_coverage_artifacts(records, sensor_metadata, coverage_directory, source_start=None, source_end=None, output=None):
+def explicit_candidate_interval(start, end, source_start, source_end):
+    from scripts import run_data_spike as spike
+
+    if start is None or end is None:
+        raise OpenAQError("Candidate start and end must be supplied together")
+    if any(value.tzinfo is None or value.utcoffset() is None for value in (start, end, source_start, source_end)):
+        raise OpenAQError("Candidate and source bounds must include timezone")
+    start, end = start.astimezone(UTC), end.astimezone(UTC)
+    if end <= start:
+        raise OpenAQError("Candidate end must be after start")
+    if start < source_start or end > source_end:
+        raise OpenAQError("Candidate outside supported source bounds")
+    chunks = hanoi_month_chunks(start, end)
+    months = [(left.astimezone(HANOI).year, left.astimezone(HANOI).month) for left, _ in chunks]
+    candidate = spike.select_primary_candidate_interval(months, HANOI)
+    if candidate is None or candidate.start_utc != start or candidate.end_utc != end:
+        raise OpenAQError("Candidate requires twelve complete Hanoi calendar months with contained winter")
+    return candidate
+
+
+def write_coverage_artifacts(records, sensor_metadata, coverage_directory, source_start=None, source_end=None, output=None, candidate_start=None, candidate_end=None):
     output = output or __import__("sys").stdout
-    coverage_path = write_coverage_report(records, coverage_directory, source_start, source_end)
+    candidate = None
+    if candidate_start is not None or candidate_end is not None:
+        chunks = sensor_history_chunks(sensor_metadata)
+        if not chunks:
+            raise OpenAQError("Unsupported source bounds")
+        candidate = explicit_candidate_interval(candidate_start, candidate_end, chunks[0][0], chunks[-1][1])
+    coverage_path = write_coverage_report(records, coverage_directory, source_start, source_end, candidate=candidate)
     report = json.loads(coverage_path.read_text())
     frozen = report["frozen_candidate"] or {"start_utc": report["source_date_range"]["start_utc"], "end_utc": report["source_date_range"]["end_utc"]}
     timestamp = frozen["start_utc"].replace(":", "").replace("-", "")
@@ -298,7 +324,7 @@ def write_coverage_artifacts(records, sensor_metadata, coverage_directory, sourc
     return {"normalized_path": normalized_path, "coverage_path": coverage_path}
 
 
-def write_coverage_report(records, coverage_directory, source_start=None, source_end=None):
+def write_coverage_report(records, coverage_directory, source_start=None, source_end=None, candidate=None):
     from scripts import run_data_spike as spike
 
     if not records:
@@ -309,7 +335,7 @@ def write_coverage_report(records, coverage_directory, source_start=None, source
     structural_start = source_start or derived_start
     structural_end = source_end or derived_end
     months = spike.complete_calendar_months(records, HANOI, structural_start, structural_end)
-    candidate = spike.select_primary_candidate_interval(months, HANOI)
+    candidate = candidate or spike.select_primary_candidate_interval(months, HANOI)
     interval_start, interval_end = (candidate.start_utc, candidate.end_utc) if candidate else (derived_start, derived_end)
     metrics = spike.pm25_metrics(records, interval_start, interval_end)
     grouped = {}
