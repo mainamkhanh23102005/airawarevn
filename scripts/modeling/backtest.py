@@ -108,8 +108,8 @@ def _month_bounds(month):
     return start, end
 
 
-def _validate_dataframe(dataframe, feature_columns):
-    required = ["event_time", *feature_columns, TARGET_COLUMN]
+def _validate_dataframe(dataframe, feature_columns, target_column=TARGET_COLUMN):
+    required = ["event_time", *feature_columns, target_column]
     missing = [column for column in required if column not in dataframe.columns]
     if missing:
         raise ValueError(f"missing required columns: {missing}")
@@ -119,20 +119,20 @@ def _validate_dataframe(dataframe, feature_columns):
         raise ValueError("backtesting dataframe must be chronologically ordered")
 
 
-def create_walk_forward_folds(dataframe, feature_columns=None):
+def create_walk_forward_folds(dataframe, feature_columns=None, target_column=TARGET_COLUMN, horizon_hours=FORECAST_HORIZON_HOURS):
     feature_columns = list(feature_columns or V1_FEATURE_COLUMNS)
-    _validate_dataframe(dataframe, feature_columns)
+    _validate_dataframe(dataframe, feature_columns, target_column)
     data = dataframe.copy()
     data["event_time"] = pd.to_datetime(data["event_time"], utc=True)
     training_start, _ = _month_bounds(INITIAL_TRAINING_MONTH)
     final_start, final_end = _month_bounds(FINAL_TEST_MONTH)
     folds = []
-    horizon = pd.Timedelta(hours=FORECAST_HORIZON_HOURS)
+    target_delay = pd.Timedelta(hours=horizon_hours)
     for month in VALIDATION_MONTHS:
         validation_start, validation_end = _month_bounds(month)
-        training = data.loc[(data["event_time"] >= training_start) & ((data["event_time"] + horizon) < validation_start)].reset_index(drop=True)
+        training = data.loc[(data["event_time"] >= training_start) & ((data["event_time"] + target_delay) < validation_start)].reset_index(drop=True)
         validation = data.loc[(data["event_time"] >= validation_start) & (data["event_time"] < validation_end)].reset_index(drop=True)
-        purged = data.loc[(data["event_time"] >= validation_start - horizon) & (data["event_time"] < validation_start)]
+        purged = data.loc[(data["event_time"] >= validation_start - target_delay) & (data["event_time"] < validation_start)]
         folds.append(WalkForwardFold(month, training, validation, validation_start, validation_end, len(purged)))
     final_data = data.loc[(data["event_time"] >= final_start) & (data["event_time"] < final_end)].reset_index(drop=True)
     return tuple(folds), ReservedPeriod(FINAL_TEST_MONTH, final_start, final_end, final_data)
@@ -223,13 +223,13 @@ def compare_baseline(predictions, ml_model_name):
     )
 
 
-def _predict(model_name, factory, feature_columns, training, validation):
+def _predict(model_name, factory, feature_columns, target_column, training, validation):
     if factory is None:
         if "pm25_lag_1h" not in validation:
             raise ValueError("persistence requires pm25_lag_1h")
         return validation["pm25_lag_1h"].to_numpy()
     model = factory()
-    model.fit(training[feature_columns], training[TARGET_COLUMN])
+    model.fit(training[feature_columns], training[target_column])
     return model.predict(validation[feature_columns])
 
 
@@ -243,18 +243,18 @@ def _macro_metrics(results, pooled):
     )
 
 
-def evaluate_walk_forward(dataframe, feature_columns=None, model_factories=None):
+def evaluate_walk_forward(dataframe, feature_columns=None, model_factories=None, target_column=TARGET_COLUMN, horizon_hours=FORECAST_HORIZON_HOURS):
     feature_columns = list(feature_columns or V1_FEATURE_COLUMNS)
     model_factories = model_factories or DEFAULT_MODEL_FACTORIES
-    folds, final_test = create_walk_forward_folds(dataframe, feature_columns)
+    folds, final_test = create_walk_forward_folds(dataframe, feature_columns, target_column, horizon_hours)
     model_results = {}
     prediction_frames = []
     for model_name, factory in model_factories.items():
         fold_results = []
         model_predictions = []
         for fold in folds:
-            actual = fold.validation[TARGET_COLUMN].to_numpy()
-            predicted = _predict(model_name, factory, feature_columns, fold.training, fold.validation)
+            actual = fold.validation[target_column].to_numpy()
+            predicted = _predict(model_name, factory, feature_columns, target_column, fold.training, fold.validation)
             frame = pd.DataFrame({"timestamp": fold.validation["event_time"], "fold": fold.name, "model": model_name, "actual_pm25": actual, "predicted_pm25": predicted})
             model_predictions.append(frame)
             prediction_frames.append(frame)
