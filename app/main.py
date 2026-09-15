@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import pickle
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from scripts.modeling.features import (
     build_v1_features,
 )
 from scripts.modeling.predict import load_artifact, predict_pm25_t_plus_6
+from scripts.modeling.forecast_bundle import load_bundle, predict_trajectory
 from scripts.modeling.train import MODEL_TYPE
 from scripts.openmeteo import OpenMeteoError, TARGET_SENSOR_ID, load_pm25_artifact
 from scripts.refresh_pm25 import refresh_current_pm25
@@ -123,6 +125,32 @@ class CurrentForecastResponse(LatestForecastResponse):
     sensor_id: int
     freshness_status: str
     age_minutes: float
+
+
+class TrajectoryPointResponse(BaseModel):
+    forecast_horizon_hours: int
+    target_interval_start: datetime
+    target_interval_end: datetime
+    predicted_pm25: Annotated[float, Field(allow_inf_nan=False)]
+
+
+class TrajectoryResponse(BaseModel):
+    schema_version: int
+    model_version: str
+    model_bundle_sha256: str
+    serving_mode: str
+    prediction_time: datetime
+    generated_at: datetime
+    source_retrieved_at: datetime
+    sensor_id: int
+    history_start: datetime
+    history_end: datetime
+    latest_completed_pm25: float
+    unit: str
+    age_minutes: float
+    freshness_status: str
+    data_mode: str
+    forecasts: list[TrajectoryPointResponse]
 
 
 class StatusResponse(BaseModel):
@@ -409,7 +437,7 @@ def _refresh_once(api_key, artifact_path):
         )
 
 
-def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_path=None, now=lambda: datetime.now(timezone.utc), forecast_ledger_path=None):
+def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_path=None, now=lambda: datetime.now(timezone.utc), forecast_ledger_path=None, multi_horizon_model_path=None):
     configured_path = Path(
         model_path or os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH)
     )
@@ -422,6 +450,7 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         or os.environ.get("AIRAWARE_CURRENT_PM25_ARTIFACT_PATH", DEFAULT_CURRENT_PM25_ARTIFACT_PATH)
     )
     configured_ledger_path = forecast_ledger_path or os.environ.get("AIRAWARE_FORECAST_LEDGER_PATH")
+    configured_multi_horizon_path = multi_horizon_model_path or os.environ.get("AIRAWARE_MULTI_HORIZON_MODEL_PATH")
     @asynccontextmanager
     async def lifespan(application):
         model, metadata = load_artifact(configured_path)
@@ -430,6 +459,14 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
         application.state.metadata = metadata
         application.state.pm25_artifact_path = configured_pm25_path
         application.state.current_pm25_artifact_path = configured_current_pm25_path
+        application.state.multi_horizon_bundle = None
+        application.state.multi_horizon_bundle_error = None
+        if configured_multi_horizon_path:
+            try:
+                application.state.multi_horizon_bundle = load_bundle(configured_multi_horizon_path)
+            except (OSError, ValueError, EOFError, KeyError, TypeError, pickle.UnpicklingError, ImportError, AttributeError):
+                logger.exception("Multi-horizon bundle unavailable")
+                application.state.multi_horizon_bundle_error = True
         application.state.forecast_store = None
         if configured_ledger_path:
             systemd_monitoring = os.environ.get("AIRAWARE_SYSTEMD_MONITORING_ENABLED") == "1"
@@ -613,6 +650,46 @@ def create_app(model_path=None, pm25_artifact_path=None, current_pm25_artifact_p
             history_start=payload.history[0].event_time,
             history_end=payload.history[-1].event_time,
             data_mode="historical_artifact",
+        )
+
+    @application.get("/forecast/trajectory", response_model=TrajectoryResponse)
+    def trajectory_forecast(request: Request):
+        bundle = request.app.state.multi_horizon_bundle
+        if bundle is None:
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL)
+        current_time = now().astimezone(timezone.utc)
+        try:
+            artifact, retrieved_at = _load_current_artifact(request.app.state.current_pm25_artifact_path)
+        except (OpenMeteoError, AttributeError, TypeError) as error:
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
+        try:
+            payload = _current_prediction_request(artifact, current_time)
+            features = _build_prediction_features(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=FORECAST_DATA_INVALID_DETAIL) from error
+        try:
+            forecasts = predict_trajectory(bundle, features)
+        except (ValueError, TypeError) as error:
+            logger.exception("Trajectory inference failed")
+            raise HTTPException(status_code=503, detail=FORECAST_SOURCE_UNAVAILABLE_DETAIL) from error
+        age_minutes = max(0.0, (current_time - payload.prediction_time).total_seconds() / 60)
+        is_stale = age_minutes > FRESHNESS_THRESHOLD_HOURS * 60
+        points = [
+            TrajectoryPointResponse(
+                forecast_horizon_hours=item["forecast_horizon_hours"],
+                target_interval_start=payload.prediction_time + timedelta(hours=item["forecast_horizon_hours"]),
+                target_interval_end=payload.prediction_time + timedelta(hours=item["forecast_horizon_hours"] + 1),
+                predicted_pm25=item["predicted_pm25"],
+            )
+            for item in forecasts
+        ]
+        return TrajectoryResponse(
+            schema_version=1, model_version=bundle.metadata["model_version"], model_bundle_sha256=bundle.sha256,
+            serving_mode="live_inference", prediction_time=payload.prediction_time, generated_at=current_time,
+            source_retrieved_at=retrieved_at, sensor_id=artifact["sensor_id"], history_start=payload.history[0].event_time,
+            history_end=payload.history[-1].event_time, latest_completed_pm25=payload.history[-1].pm25,
+            unit="µg/m³", age_minutes=age_minutes, freshness_status="stale" if is_stale else "fresh",
+            data_mode="stale_openaq" if is_stale else "fresh_openaq", forecasts=points,
         )
 
     @application.get("/forecast/current", response_model=CurrentForecastResponse)
