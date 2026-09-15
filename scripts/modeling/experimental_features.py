@@ -40,6 +40,14 @@ ABLATION_FEATURE_COLUMNS = {
     "A4": [*FROZEN_A0_FEATURE_COLUMNS, *CYCLICAL_CALENDAR_COLUMNS],
     "A5": [*FROZEN_A0_FEATURE_COLUMNS, *DYNAMICS_COLUMNS, *SHORT_LAG_COLUMNS],
 }
+M8_FEATURE_DEFINITION_VERSION = 1
+M8_FEATURE_COLUMNS = {
+    "A2": tuple(ABLATION_FEATURE_COLUMNS["A2"]),
+    "M8_STD6": (*ABLATION_FEATURE_COLUMNS["A2"], "pm25_rolling_std_6h"),
+    "M8_STD6_12": (*ABLATION_FEATURE_COLUMNS["A2"], "pm25_rolling_std_6h", "pm25_rolling_std_12h"),
+    "M8_STD6_12_24": (*ABLATION_FEATURE_COLUMNS["A2"], "pm25_rolling_std_6h", "pm25_rolling_std_12h", "pm25_rolling_std_24h"),
+    "M8_HOUR": (*ABLATION_FEATURE_COLUMNS["A2"], "hour_sin", "hour_cos"),
+}
 
 
 def build_experimental_features(dataframe, include_target=False):

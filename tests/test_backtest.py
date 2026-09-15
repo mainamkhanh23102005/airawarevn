@@ -333,6 +333,140 @@ class BaselineComparisonTests(unittest.TestCase):
                 self.assertIn(text, output)
 
 
+class M8ExperimentTests(unittest.TestCase):
+    def raw(self):
+        times = pd.date_range("2025-08-01", "2026-07-02", freq="h", tz="UTC")
+        return pd.DataFrame({"event_time": times, "pm25": [float(i % 37) for i in range(len(times))]})
+
+    def test_registry_is_frozen_separate_and_features_are_completed(self):
+        from scripts.modeling.experimental_features import M8_FEATURE_COLUMNS
+        self.assertEqual(list(M8_FEATURE_COLUMNS), ["A2", "M8_STD6", "M8_STD6_12", "M8_STD6_12_24", "M8_HOUR"])
+        for name, extra in [("A2", []), ("M8_STD6", ["pm25_rolling_std_6h"]), ("M8_STD6_12", ["pm25_rolling_std_6h", "pm25_rolling_std_12h"]), ("M8_STD6_12_24", ["pm25_rolling_std_6h", "pm25_rolling_std_12h", "pm25_rolling_std_24h"]), ("M8_HOUR", ["hour_sin", "hour_cos"])]:
+            self.assertEqual(list(M8_FEATURE_COLUMNS[name]), V1_FEATURE_COLUMNS + extra)
+        self.assertEqual(set(ABLATION_FEATURE_COLUMNS), {"A0", "A1", "A2", "A3", "A4", "A5"})
+        raw = self.raw().iloc[:60].copy()
+        raw["pm25"] = [float((i * i + 7 * i) % 43) for i in range(len(raw))]
+        before = build_experimental_features(raw, include_target=True)
+        origin = 30
+        for width in (6, 12, 24):
+            self.assertAlmostEqual(before.loc[origin, f"pm25_rolling_std_{width}h"], raw.pm25.iloc[origin-width:origin].std(ddof=1))
+        self.assertEqual(before.loc[origin, "pm25_diff_1h"], raw.pm25.iloc[29] - raw.pm25.iloc[28])
+        self.assertEqual(before.loc[origin, "pm25_diff_3h"], raw.pm25.iloc[29] - raw.pm25.iloc[26])
+        self.assertEqual(before.loc[origin, "pm25_trend_6h"], raw.pm25.iloc[29] - raw.pm25.iloc[24])
+        self.assertEqual(before.loc[origin, TARGET_COLUMN], raw.pm25.iloc[36])
+        raw.loc[origin:, "pm25"] = 9999.0
+        after = build_experimental_features(raw.iloc[::-1], include_target=True)
+        columns = list(dict.fromkeys(column for columns in M8_FEATURE_COLUMNS.values() for column in columns))
+        pd.testing.assert_series_equal(before.loc[origin, columns], after.loc[origin, columns])
+        self.assertNotEqual(before.loc[origin, TARGET_COLUMN], after.loc[origin, TARGET_COLUMN])
+
+    def test_common_cohort_refits_training_and_validation_and_hashes(self):
+        from scripts.modeling.ablation import run_m8_experiment
+        from scripts.modeling.experimental_features import build_experimental_features as build
+        raw = self.raw()
+        def missing(frame, include_target=False):
+            result = build(frame, include_target=include_target)
+            result.loc[result.event_time.isin(pd.to_datetime(["2025-10-10", "2026-03-10"], utc=True)), "pm25_rolling_std_6h"] = float("nan")
+            return result
+        with patch("scripts.modeling.ablation.load_frozen_pm25_dataframe", return_value=raw), patch("scripts.modeling.ablation.build_experimental_features", side_effect=missing):
+            result = run_m8_experiment(Path(__file__))
+            repeated = run_m8_experiment(Path(__file__))
+        self.assertEqual(result, repeated)
+        native, common = result["cohorts"]["native"], result["cohorts"]["common"]
+        self.assertEqual(native["A2"]["evaluated_count"] - common["A2"]["evaluated_count"], 1)
+        self.assertEqual(native["A2"]["folds"][0]["training_count"] - common["A2"]["folds"][0]["training_count"], 1)
+        for variant in common.values():
+            self.assertEqual(variant["cohort_id"], common["A2"]["cohort_id"])
+            self.assertEqual([(f["training_id"], f["validation_id"]) for f in variant["folds"]], [(f["training_id"], f["validation_id"]) for f in common["A2"]["folds"]])
+            self.assertEqual([f["name"] for f in variant["folds"]], list(VALIDATION_MONTHS))
+            self.assertEqual(variant["late_june_target_count"], 6)
+        self.assertNotEqual(common["A2"]["schema_id"], common["M8_HOUR"]["schema_id"])
+        self.assertEqual(len(common["A2"]["schema_id"]), 64)
+        self.assertEqual(common["A2"]["paired_a2_mae_change"], 0)
+        self.assertIn("pm25_rolling_std_6h", result["missing_counts"])
+        self.assertTrue(common["A2"]["cohort_differs_from_a2"])
+        self.assertEqual(common["A2"]["paired_a2_mae"], common["A2"]["paired_candidate_mae"])
+
+    def test_provenance_and_actual_estimator_cohorts(self):
+        import hashlib
+        from scripts.modeling.ablation import run_m8_experiment
+        from scripts.modeling.experimental_features import M8_FEATURE_DEFINITION_VERSION
+        raw = self.raw()
+        featured = build_experimental_features(raw, include_target=True)
+        featured.loc[featured.event_time.isin(pd.to_datetime(["2025-10-10", "2026-03-10"], utc=True)), "pm25_rolling_std_6h"] = float("nan")
+        calls = []
+        class RecordingLinearRegression(LinearRegression):
+            def fit(self, X, y):
+                calls.append(("fit", X.copy(), y.copy()))
+                return super().fit(X, y)
+
+            def predict(self, X):
+                calls.append(("predict", X.copy(), None))
+                return super().predict(X)
+        with patch("scripts.modeling.ablation.load_frozen_pm25_dataframe", return_value=raw), patch("scripts.modeling.ablation.build_experimental_features", return_value=featured), patch("scripts.modeling.ablation.LinearRegression", RecordingLinearRegression):
+            result = run_m8_experiment(Path(__file__))
+        self.assertEqual(result["input_sha256"], hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+        self.assertEqual(result["experimental_feature_definition_version"], M8_FEATURE_DEFINITION_VERSION)
+        from scripts.modeling.experimental_features import M8_FEATURE_COLUMNS
+        union = list(dict.fromkeys(c for columns in M8_FEATURE_COLUMNS.values() for c in columns))
+        common = featured.dropna(subset=union + [TARGET_COLUMN])
+        self.assertEqual(len(calls), 100)
+        for index, columns in enumerate(M8_FEATURE_COLUMNS.values()):
+            for month_index, month in enumerate(VALIDATION_MONTHS):
+                start = pd.Timestamp(month + "-01", tz="Asia/Ho_Chi_Minh").tz_convert("UTC")
+                end = start.tz_convert("Asia/Ho_Chi_Minh") + pd.offsets.MonthBegin(1)
+                training = common.loc[(common.event_time >= pd.Timestamp("2025-07-31T17:00:00Z")) & (common.event_time + pd.Timedelta(hours=6) < start)]
+                validation = common.loc[(common.event_time >= start) & (common.event_time < end)]
+                fit, predict = calls[50 + index * 10 + month_index * 2:52 + index * 10 + month_index * 2]
+                pd.testing.assert_frame_equal(fit[1].reset_index(drop=True), training[list(columns)].reset_index(drop=True))
+                pd.testing.assert_series_equal(fit[2].reset_index(drop=True), training[TARGET_COLUMN].reset_index(drop=True))
+                pd.testing.assert_frame_equal(predict[1].reset_index(drop=True), validation[list(columns)].reset_index(drop=True))
+                self.assertTrue((validation.event_time < pd.Timestamp("2026-06-30T17:00:00Z")).all())
+        baseline = result["cohorts"]["common"]["A2"]
+        self.assertAlmostEqual(baseline["canonical_a2_mae_change_percent"], baseline["canonical_a2_mae_change"] / 9.855844823038945 * 100)
+        self.assertAlmostEqual(baseline["canonical_persistence_mae_change_percent"], baseline["canonical_persistence_mae_change"] / 11.307251308900524 * 100)
+
+    def test_duplicate_origins_rejected(self):
+        from scripts.modeling.ablation import run_m8_experiment
+        raw = self.raw()
+        with patch("scripts.modeling.ablation.load_frozen_pm25_dataframe", return_value=pd.concat([raw, raw.iloc[:1]])):
+            with self.assertRaisesRegex(ValueError, "unique"):
+                run_m8_experiment(Path("synthetic.json"))
+
+    def test_m8_missingness_calendar_and_repeatability(self):
+        raw = self.raw().iloc[:100].copy()
+        raw.loc[40, "pm25"] = float("nan")
+        result = build_experimental_features(raw, include_target=True)
+        pd.testing.assert_frame_equal(result, build_experimental_features(raw.iloc[::-1], include_target=True))
+        for width in (6, 12, 24):
+            self.assertTrue(result.loc[41:40+width, f"pm25_rolling_std_{width}h"].isna().all())
+            self.assertTrue(pd.notna(result.loc[41+width, f"pm25_rolling_std_{width}h"]))
+        self.assertTrue(pd.isna(result.loc[34, TARGET_COLUMN]))
+        self.assertAlmostEqual(result.loc[17, "hour_sin"], 0, places=12)
+        self.assertAlmostEqual(result.loc[17, "hour_cos"], 1, places=12)
+
+    @unittest.skipUnless(CANONICAL_ARTIFACT_AVAILABLE, CANONICAL_ARTIFACT_SKIP_REASON)
+    def test_m8_canonical_cohorts_and_cli(self):
+        from scripts.modeling.ablation import run_m8_experiment
+        result = run_m8_experiment(ARTIFACT)
+        for mode, variants in result["cohorts"].items():
+            baseline = variants["A2"]
+            self.assertAlmostEqual(baseline["models"]["linear_regression"]["mae"], 9.855844823038945, places=12)
+            self.assertAlmostEqual(baseline["models"]["persistence"]["mae"], 11.307251308900524, places=12)
+            for variant in variants.values():
+                self.assertEqual(variant["evaluated_count"], 3056)
+                self.assertEqual(variant["late_june_target_count"], 6)
+                self.assertEqual(variant["common_removed_count"], 0)
+                self.assertTrue(variant["paired_a2_training_matched"])
+                self.assertEqual([f["training_count"] for f in variant["folds"]], [3655, 4327, 5028, 5717, 6384])
+                self.assertEqual([f["validation_count"] for f in variant["folds"]], [672, 701, 689, 667, 327])
+        stdout = io.StringIO()
+        with patch("scripts.modeling.ablation.run_m8_experiment", return_value=result), patch("sys.stdout", stdout):
+            self.assertEqual(ablation_main(["--m8"]), result)
+        import json
+        self.assertEqual(json.loads(stdout.getvalue()), result)
+
+
 class M7MetricsTests(unittest.TestCase):
     def synthetic_report(self):
         rows = [{"event_time": pd.Timestamp("2025-08-01", tz="UTC"), "pm25_lag_1h": 10.0, TARGET_COLUMN: 10.0}]
