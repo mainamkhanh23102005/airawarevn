@@ -51,6 +51,7 @@ class Metrics:
     absolute_error_p95: float
     maximum_absolute_error: float
     high_pm25: dict[float, HighPm25Metrics]
+    evaluated_forecast_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,12 @@ def create_walk_forward_folds(dataframe, feature_columns=None):
 def calculate_error_metrics(actual, predicted):
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
+    if actual.ndim != 1 or predicted.ndim != 1 or actual.shape != predicted.shape:
+        raise ValueError("actual and predicted must have matching one-dimensional shapes")
+    if actual.size == 0:
+        raise ValueError("actual and predicted must be nonempty")
+    if not np.isfinite(actual).all() or not np.isfinite(predicted).all():
+        raise ValueError("actual and predicted must contain only finite values")
     error = predicted - actual
     absolute = np.abs(error)
     high = {}
@@ -162,6 +169,7 @@ def calculate_error_metrics(actual, predicted):
         float(np.percentile(absolute, 95)),
         float(absolute.max()),
         high,
+        len(actual),
     )
 
 
@@ -175,6 +183,10 @@ class BaselineComparison:
     baseline_mae: float | None
     improvement_percent: float | None
     evaluated_forecast_count: int
+    ml_rmse: float | None = None
+    ml_bias: float | None = None
+    baseline_rmse: float | None = None
+    baseline_bias: float | None = None
 
 
 def compare_baseline(predictions, ml_model_name):
@@ -202,10 +214,13 @@ def compare_baseline(predictions, ml_model_name):
         raise ValueError("ML and persistence must have identical actual targets")
     if ml.empty:
         return BaselineComparison(None, None, None, 0)
-    ml_mae = calculate_error_metrics(ml["actual_pm25"], ml["predicted_pm25"]).mae
-    baseline_mae = calculate_error_metrics(baseline["actual_pm25"], baseline["predicted_pm25"]).mae
-    improvement = (baseline_mae - ml_mae) / baseline_mae * 100 if baseline_mae else None
-    return BaselineComparison(ml_mae, baseline_mae, improvement, len(ml))
+    ml_metrics = calculate_error_metrics(ml["actual_pm25"], ml["predicted_pm25"])
+    baseline_metrics = calculate_error_metrics(baseline["actual_pm25"], baseline["predicted_pm25"])
+    improvement = (baseline_metrics.mae - ml_metrics.mae) / baseline_metrics.mae * 100 if baseline_metrics.mae else None
+    return BaselineComparison(
+        ml_metrics.mae, baseline_metrics.mae, improvement, len(ml),
+        ml_metrics.rmse, ml_metrics.bias, baseline_metrics.rmse, baseline_metrics.bias,
+    )
 
 
 def _predict(model_name, factory, feature_columns, training, validation):
@@ -224,6 +239,7 @@ def _macro_metrics(results, pooled):
             "mae", "rmse", "bias", "absolute_error_p50", "absolute_error_p90", "absolute_error_p95", "maximum_absolute_error"
         )),
         pooled.high_pm25,
+        sum(result.metrics.evaluated_forecast_count for result in results),
     )
 
 

@@ -329,8 +329,111 @@ class BaselineComparisonTests(unittest.TestCase):
             self.assertEqual(evaluate.call_args.kwargs["model_factories"], {"linear_regression": LinearRegression, "persistence": None})
             ablate.assert_not_called()
             output = stdout.getvalue()
-            for text in ("ml_mae=", "baseline_mae=", "improvement_percent=" + percentage, "evaluated_forecast_count=1", "verdict=" + verdict, "pm25_lag_1h", "latest completed hour", "t+6h", "2025-08", "2026-02", "2026-06", "2026-07", "Asia/Ho_Chi_Minh", "strict", "pooled", "A2"):
+            for text in ("ml_mae=", "baseline_mae=", f"ml_rmse={abs(ml - 10):.1f}", f"ml_bias={ml - 10:.1f}", f"baseline_rmse={abs(baseline - 10):.1f}", f"baseline_bias={baseline - 10:.1f}", "Bias = predicted - actual", "positive = overprediction", "negative = underprediction", "July origins reserved", "six late-June +6h targets in July retained", "improvement_percent=" + percentage, "evaluated_forecast_count=1", "verdict=" + verdict, "pm25_lag_1h", "latest completed hour", "t+6h", "2025-08", "2026-02", "2026-06", "2026-07", "Asia/Ho_Chi_Minh", "strict", "pooled", "A2"):
                 self.assertIn(text, output)
+
+
+class M7MetricsTests(unittest.TestCase):
+    def synthetic_report(self):
+        rows = [{"event_time": pd.Timestamp("2025-08-01", tz="UTC"), "pm25_lag_1h": 10.0, TARGET_COLUMN: 10.0}]
+        for count, month in enumerate(VALIDATION_MONTHS, 1):
+            for hour in range(count):
+                rows.append({"event_time": pd.Timestamp(month + "-02", tz="UTC") + pd.Timedelta(hours=hour), "pm25_lag_1h": 10.0 + count, TARGET_COLUMN: 10.0})
+        return evaluate_walk_forward(pd.DataFrame(rows), feature_columns=["pm25_lag_1h"], model_factories={"persistence": None})
+
+    def test_exact_mae_rmse_bias_and_rmse_bound(self):
+        metrics = calculate_error_metrics([10, 20, 30], [12, 16, 30])
+        self.assertEqual(metrics.mae, 2.0)
+        self.assertAlmostEqual(metrics.rmse, (20 / 3) ** 0.5)
+        self.assertAlmostEqual(metrics.bias, -2 / 3)
+        self.assertGreaterEqual(metrics.rmse, metrics.mae)
+
+    def test_positive_negative_and_zero_bias(self):
+        for predicted, bias in [([12, 24], 3), ([8, 16], -3), ([8, 22], 0)]:
+            with self.subTest(predicted=predicted):
+                self.assertEqual(calculate_error_metrics([10, 20], predicted).bias, bias)
+
+    def test_evaluated_forecast_count(self):
+        self.assertEqual(calculate_error_metrics([10, 20, 30], [12, 16, 30]).evaluated_forecast_count, 3)
+
+    def test_row_order_independence(self):
+        self.assertEqual(calculate_error_metrics([10, 20, 30], [12, 16, 30]), calculate_error_metrics([30, 10, 20], [30, 12, 16]))
+
+    def test_nonfinite_actuals_and_predictions(self):
+        for side in (0, 1):
+            for value in (float("nan"), float("inf"), -float("inf")):
+                values = [[10.0, 20.0], [12.0, 16.0]]
+                values[side][0] = value
+                with self.subTest(side=side, value=value), self.assertRaisesRegex(ValueError, "finite"):
+                    calculate_error_metrics(*values)
+
+    def test_empty_metrics_explicit_error(self):
+        with self.assertRaisesRegex(ValueError, "actual and predicted must be nonempty"):
+            calculate_error_metrics([], [])
+
+    def test_mismatched_and_non_1d_shapes(self):
+        for actual, predicted in [([1, 2], [1]), ([1], [1, 2]), ([[1, 2]], [[1, 2]]), ([1, 2], [[1], [2]]), (1, 2)]:
+            with self.subTest(actual=actual, predicted=predicted), self.assertRaisesRegex(ValueError, "matching one-dimensional shapes"):
+                calculate_error_metrics(actual, predicted)
+
+    def test_unequal_folds_pool_rows_not_fold_metrics(self):
+        report = self.synthetic_report()
+        model = report.models["persistence"]
+        self.assertEqual([fold.validation_count for fold in model.folds], [1, 2, 3, 4, 5])
+        self.assertEqual(model.pooled.mae, 55 / 15)
+        self.assertEqual(model.pooled.bias, 55 / 15)
+        self.assertAlmostEqual(model.pooled.rmse, (225 / 15) ** 0.5)
+        self.assertEqual(model.macro.mae, 3.0)
+        self.assertEqual(model.macro.rmse, 3.0)
+        self.assertEqual(model.macro.bias, 3.0)
+        self.assertNotEqual(model.pooled.rmse, model.macro.rmse)
+        self.assertEqual(model.pooled.evaluated_forecast_count, 15)
+        self.assertEqual(model.macro.evaluated_forecast_count, 15)
+        self.assertEqual([fold.metrics.evaluated_forecast_count for fold in model.folds], [1, 2, 3, 4, 5])
+
+    def test_baseline_new_metrics_and_empty_cohort(self):
+        from scripts.modeling.backtest import BaselineComparison, compare_baseline
+        records = BaselineComparisonTests().records(8, 13)
+        result = compare_baseline(records, "linear_regression")
+        self.assertEqual((result.ml_rmse, result.ml_bias, result.baseline_rmse, result.baseline_bias), (2, -2, 3, 3))
+
+    def test_empty_baseline_new_metrics_unavailable(self):
+        from scripts.modeling.backtest import BaselineComparison, compare_baseline
+        records = BaselineComparisonTests().records()
+        empty = compare_baseline(records.iloc[:0], "linear_regression")
+        self.assertEqual(empty.evaluated_forecast_count, 0)
+        for field in ("ml_mae", "baseline_mae", "improvement_percent", "ml_rmse", "ml_bias", "baseline_rmse", "baseline_bias"):
+            self.assertIsNone(getattr(empty, field))
+        self.assertEqual(empty, BaselineComparison(None, None, None, 0))
+
+    def test_normal_cli_fold_and_pooled_bias_count(self):
+        from scripts.modeling.ablation import AblationResult
+        report = self.synthetic_report()
+        stdout = io.StringIO()
+        with patch("scripts.modeling.ablation.run_feature_ablation", return_value={"A2": AblationResult("A2", ("pm25_lag_1h",), 15, report)}), patch("sys.stdout", stdout):
+            ablation_main([])
+        lines = stdout.getvalue().splitlines()
+        for count, month in enumerate(VALIDATION_MONTHS, 1):
+            line = next(line for line in lines if month in line)
+            self.assertIn(f"Bias={count:.4f}", line)
+            self.assertIn(f"evaluated_forecast_count={count}", line)
+        pooled = next(line for line in lines if "pooled:" in line)
+        self.assertIn("Bias=3.6667", pooled)
+        self.assertIn("evaluated_forecast_count=15", pooled)
+
+    @unittest.skipUnless(CANONICAL_ARTIFACT_AVAILABLE, CANONICAL_ARTIFACT_SKIP_REASON)
+    def test_canonical_m6_metrics_and_late_june_targets(self):
+        from scripts.modeling.backtest import compare_baseline
+        report = evaluate_walk_forward(build_modeling_dataframe(ARTIFACT), model_factories={"linear_regression": LinearRegression, "persistence": None})
+        comparison = compare_baseline(report.predictions, "linear_regression")
+        self.assertAlmostEqual(comparison.ml_mae, 9.855844823038945, places=12)
+        self.assertAlmostEqual(comparison.baseline_mae, 11.307251308900524, places=12)
+        self.assertEqual(comparison.evaluated_forecast_count, 3056)
+        for model in report.models.values():
+            self.assertEqual(model.pooled.evaluated_forecast_count, 3056)
+        june = report.predictions.query("model == 'persistence' and fold == '2026-06'")
+        self.assertEqual(int(((june.timestamp + pd.Timedelta(hours=6)) >= report.final_test.start).sum()), 6)
+        self.assertTrue((report.predictions.timestamp < report.final_test.start).all())
 
 
 if __name__ == "__main__":

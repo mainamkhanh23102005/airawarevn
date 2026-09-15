@@ -48,10 +48,12 @@ def main(argv=None):
         comparison = compare_baseline(report.predictions, "linear_regression")
         print("Fixed A2 LinearRegression vs persistence; no tuning.")
         print("Baseline: pm25_lag_1h = latest completed hour available at origin t; forecast target t+6h.")
-        print("Methodology: pooled OOF MAEs on identical complete feature/target rows; no imputation.")
-        print("Expanding monthly training from 2025-08; validation 2026-02 through 2026-06 (Asia/Ho_Chi_Minh); 2026-07 reserved, not scored.")
+        print("Methodology: pooled OOF MAEs on identical complete feature/target rows; no imputation. RMSE and Bias use the same rows.")
+        print("Bias = predicted - actual; positive = overprediction; negative = underprediction.")
+        print("Expanding monthly training from 2025-08; validation 2026-02 through 2026-06 (Asia/Ho_Chi_Minh); 2026-07 July origins reserved, not scored; canonical cohort: six late-June +6h targets in July retained.")
         print("Chronology: strict training target time < validation start; six-hour boundary purge.")
         print(f"ml_mae={comparison.ml_mae} baseline_mae={comparison.baseline_mae} evaluated_forecast_count={comparison.evaluated_forecast_count}")
+        print(f"ml_rmse={comparison.ml_rmse} ml_bias={comparison.ml_bias} baseline_rmse={comparison.baseline_rmse} baseline_bias={comparison.baseline_bias}")
         percentage = "unavailable (empty cohort or zero baseline MAE)" if comparison.improvement_percent is None else f"{comparison.improvement_percent:.4f}%"
         verdict = "unavailable"
         if comparison.ml_mae is not None and comparison.baseline_mae is not None:
@@ -67,12 +69,16 @@ def main(argv=None):
                     f"  {model_name} {fold.name}: "
                     f"n={fold.validation_count} "
                     f"MAE={fold.metrics.mae:.4f} "
-                    f"RMSE={fold.metrics.rmse:.4f}"
+                    f"RMSE={fold.metrics.rmse:.4f} "
+                    f"Bias={fold.metrics.bias:.4f} "
+                    f"evaluated_forecast_count={fold.metrics.evaluated_forecast_count}"
                 )
             print(
                 f"  {model_name} pooled: n={model.total_oof_count} "
                 f"MAE={model.pooled.mae:.4f} "
-                f"RMSE={model.pooled.rmse:.4f}"
+                f"RMSE={model.pooled.rmse:.4f} "
+                f"Bias={model.pooled.bias:.4f} "
+                f"evaluated_forecast_count={model.pooled.evaluated_forecast_count}"
             )
     return results
 
