@@ -23,11 +23,17 @@
     #accuracy { color: #4b6155; }
     #accuracy h2 { color: #4b6155; }
     #accuracy p { margin: .5rem 0 0; }
+    #trajectory-chart { display: block; width: 100%; height: auto; margin-top: 1rem; }
+    #trajectory-chart path { fill: none; stroke: #176b45; stroke-width: 3; }
+    #trajectory-chart circle { fill: #176b45; }
+    #trajectory-chart text { fill: #4b6155; font-size: 11px; }
+    #trajectory-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .5rem 1rem; padding: 0; margin: 1rem 0 0; list-style: none; }
+    #trajectory-list li { color: #4b6155; font-size: .9rem; }
     #status { min-height: 1.5rem; margin: 1.5rem 0 0; }
     button { margin-top: 1.5rem; border: 0; background: #176b45; color: white; padding: .75rem 1rem; font: inherit; font-weight: 700; cursor: pointer; }
     button:focus-visible { outline: 3px solid #17211c; outline-offset: 3px; }
     button:disabled { cursor: wait; opacity: .65; }
-    @media (max-width: 32rem) { #forecast { grid-template-columns: 1fr; } }
+    @media (max-width: 32rem) { #forecast { grid-template-columns: 1fr; } #trajectory-list { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -56,6 +62,25 @@
         <p id="expected-change" class="change">Outlook unavailable.</p>
         <p id="outlook-guidance" class="note"></p>
         <p id="sensitive-guidance" class="note" hidden></p>
+      </section>
+
+      <section id="trajectory" class="full" aria-labelledby="trajectory-title" aria-busy="true">
+        <h2 id="trajectory-title">6-hour trajectory</h2>
+        <p id="trajectory-summary" class="note" role="status" aria-live="polite">Loading trajectory…</p>
+        <p id="trajectory-direction" class="change"></p>
+        <svg id="trajectory-chart" viewBox="0 0 600 180" role="img" aria-label="Six-hour PM2.5 forecast trajectory" hidden>
+          <path id="trajectory-line"></path>
+          <circle id="trajectory-dot-1" r="4"></circle><circle id="trajectory-dot-2" r="4"></circle>
+          <circle id="trajectory-dot-3" r="4"></circle><circle id="trajectory-dot-4" r="4"></circle>
+          <circle id="trajectory-dot-5" r="4"></circle><circle id="trajectory-dot-6" r="4"></circle>
+          <text id="trajectory-label-1" text-anchor="middle"></text><text id="trajectory-label-2" text-anchor="middle"></text>
+          <text id="trajectory-label-3" text-anchor="middle"></text><text id="trajectory-label-4" text-anchor="middle"></text>
+          <text id="trajectory-label-5" text-anchor="middle"></text><text id="trajectory-label-6" text-anchor="middle"></text>
+        </svg>
+        <ol id="trajectory-list" aria-label="Six-hour PM2.5 forecast points">
+          <li id="trajectory-point-1"></li><li id="trajectory-point-2"></li><li id="trajectory-point-3"></li>
+          <li id="trajectory-point-4"></li><li id="trajectory-point-5"></li><li id="trajectory-point-6"></li>
+        </ol>
       </section>
 
       <section class="full" aria-labelledby="freshness-title">
@@ -93,6 +118,12 @@
         var date = new Date(value);
         if (Number.isNaN(date.getTime())) return "Unavailable";
         return timeFormatter.format(date) + " ICT";
+      }
+
+      function formatIctClock(value) {
+        var date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "Unavailable";
+        return new Intl.DateTimeFormat("en-GB", { timeZone: ICT_TIME_ZONE, hour: "2-digit", minute: "2-digit" }).format(date) + " ICT";
       }
 
       function finiteValue(value) {
@@ -157,6 +188,57 @@
             outlook: outlook,
           },
         };
+      }
+
+      function buildTrajectoryModel(data) {
+        var source = data && typeof data === "object" ? data : {};
+        if (source.schema_version !== 1 || typeof source.model_version !== "string" || source.model_version.trim() === "" ||
+            typeof source.model_bundle_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(source.model_bundle_sha256) ||
+            !Array.isArray(source.forecasts) || source.forecasts.length !== 6) {
+          return { ok: false, reason: "invalid_trajectory" };
+        }
+        var previousEnd = -Infinity;
+        var points = [];
+        for (var index = 0; index < source.forecasts.length; index += 1) {
+          var point = source.forecasts[index];
+          if (!point || typeof point !== "object" || point.forecast_horizon_hours !== index + 1) {
+            return { ok: false, reason: "invalid_horizon" };
+          }
+          if (typeof point.predicted_pm25 !== "number" ||
+              typeof point.target_interval_start !== "string" || typeof point.target_interval_end !== "string") {
+            return { ok: false, reason: "invalid_point" };
+          }
+          var pm25 = finiteValue(point.predicted_pm25);
+          var start = timestamp(point.target_interval_start);
+          var end = timestamp(point.target_interval_end);
+          if (!Number.isFinite(pm25) || Number.isNaN(start) || Number.isNaN(end) || end - start !== 3600000 ||
+              (index > 0 && start !== previousEnd)) {
+            return { ok: false, reason: "invalid_point" };
+          }
+          points.push({ horizon: index + 1, pm25: pm25, start: start, end: end });
+          previousEnd = end;
+        }
+        var peak = points[0];
+        var low = points[0];
+        for (var itemIndex = 1; itemIndex < points.length; itemIndex += 1) {
+          if (points[itemIndex].pm25 > peak.pm25) peak = points[itemIndex];
+          if (points[itemIndex].pm25 < low.pm25) low = points[itemIndex];
+        }
+        var change = points[5].pm25 - points[0].pm25;
+        var direction = change > -0.05 && change < 0.05 ? "stable" : change <= -0.05 ? "improving" : "worsening";
+        return { ok: true, model: { points: points, peak: peak, low: low, direction: direction } };
+      }
+
+      function trajectoryDirectionText(direction) {
+        return { improving: "Improving overall.", stable: "Stable overall.", worsening: "Worsening overall." }[direction];
+      }
+
+      function trajectoryPointText(point) {
+        return "+" + point.horizon + "h · " + formatIct(point.start) + " · " + point.pm25.toFixed(1) + " µg/m³";
+      }
+
+      function trajectorySummaryText(model) {
+        return "Peak " + model.peak.pm25.toFixed(1) + " µg/m³ at " + formatIct(model.peak.start) + ". Lowest " + model.low.pm25.toFixed(1) + " µg/m³ at " + formatIct(model.low.start) + ". " + trajectoryDirectionText(model.direction);
       }
 
       function changeText(model) {
@@ -234,9 +316,16 @@
       }
 
       root.AirAwareView = {
-        formatIct: formatIct,
-        buildModel: buildModel,
-        changeText: changeText,
+         formatIct: formatIct,
+         formatIctClock: formatIctClock,
+         buildModel: buildModel,
+
+         buildTrajectoryModel: buildTrajectoryModel,
+         trajectoryDirectionText: trajectoryDirectionText,
+         trajectoryPointText: trajectoryPointText,
+         trajectorySummaryText: trajectorySummaryText,
+         changeText: changeText,
+
         observedText: observedText,
         expectedText: expectedText,
         freshnessText: freshnessText,
@@ -264,8 +353,17 @@
       var categoryEl = document.querySelector("#outlook-category");
       var guidanceEl = document.querySelector("#outlook-guidance");
       var sensitiveEl = document.querySelector("#sensitive-guidance");
-      var freshnessEl = document.querySelector("#freshness");
-      var accuracyEl = document.querySelector("#accuracy");
+       var freshnessEl = document.querySelector("#freshness");
+       var trajectoryEl = document.querySelector("#trajectory");
+       var trajectorySummaryEl = document.querySelector("#trajectory-summary");
+       var trajectoryDirectionEl = document.querySelector("#trajectory-direction");
+       var trajectoryChartEl = document.querySelector("#trajectory-chart");
+       var trajectoryLineEl = document.querySelector("#trajectory-line");
+       var trajectoryDotEls = [1, 2, 3, 4, 5, 6].map(function (index) { return document.querySelector("#trajectory-dot-" + index); });
+       var trajectoryLabelEls = [1, 2, 3, 4, 5, 6].map(function (index) { return document.querySelector("#trajectory-label-" + index); });
+       var trajectoryPointEls = [1, 2, 3, 4, 5, 6].map(function (index) { return document.querySelector("#trajectory-point-" + index); });
+       var accuracyEl = document.querySelector("#accuracy");
+
       var accuracySummaryEl = document.querySelector("#accuracy-summary");
       var accuracyExplanationEl = document.querySelector("#accuracy-explanation");
       var accuracyComparisonEl = document.querySelector("#accuracy-comparison");
@@ -273,7 +371,8 @@
 
       var state = "loading";
 
-      var hasValidPrior = false;
+       var hasValidPrior = false;
+       var trajectoryRequestId = 0;
 
       function setBusy(busy) {
         forecastEl.setAttribute("aria-busy", busy ? "true" : "false");
@@ -335,7 +434,52 @@
         setBusy(false);
       }
 
-      function applyPerformance(model) {
+       function applyTrajectory(model) {
+         var values = model.points.map(function (point) { return point.pm25; });
+         var minimum = Math.min.apply(null, values);
+         var maximum = Math.max.apply(null, values);
+         var range = maximum - minimum || 1;
+         var coordinates = model.points.map(function (point, index) {
+           return { x: 40 + index * 104, y: 140 - ((point.pm25 - minimum) / range) * 100 };
+         });
+         trajectorySummaryEl.textContent = view.trajectorySummaryText(model);
+         trajectoryDirectionEl.textContent = view.trajectoryDirectionText(model.direction);
+         trajectoryPointEls.forEach(function (element, index) { element.textContent = view.trajectoryPointText(model.points[index]); });
+         trajectoryLineEl.setAttribute("d", coordinates.map(function (point, index) { return (index === 0 ? "M" : "L") + point.x + " " + point.y; }).join(" "));
+         trajectoryDotEls.forEach(function (element, index) { element.setAttribute("cx", coordinates[index].x); element.setAttribute("cy", coordinates[index].y); });
+         trajectoryLabelEls.forEach(function (element, index) { element.setAttribute("x", coordinates[index].x); element.setAttribute("y", 165); element.textContent = "+" + model.points[index].horizon + "h " + view.formatIctClock(model.points[index].start); });
+         trajectoryChartEl.hidden = false;
+         trajectoryEl.setAttribute("aria-busy", "false");
+       }
+
+       function showTrajectoryUnavailable() {
+         trajectorySummaryEl.textContent = "Trajectory unavailable right now.";
+         trajectoryDirectionEl.textContent = "";
+         trajectoryPointEls.forEach(function (element) { element.textContent = ""; });
+         trajectoryChartEl.hidden = true;
+         trajectoryEl.setAttribute("aria-busy", "false");
+       }
+
+       async function loadTrajectory() {
+         var requestId = trajectoryRequestId + 1;
+         trajectoryRequestId = requestId;
+         trajectoryEl.setAttribute("aria-busy", "true");
+         trajectorySummaryEl.textContent = "Loading trajectory…";
+         try {
+           var response = await fetch("/forecast/trajectory");
+           if (!response.ok) throw new Error("Trajectory unavailable right now.");
+           var result = view.buildTrajectoryModel(await response.json());
+           if (!result.ok) throw new Error("Trajectory unavailable right now.");
+           if (requestId !== trajectoryRequestId) return;
+           applyTrajectory(result.model);
+         } catch (error) {
+           if (requestId !== trajectoryRequestId) return;
+           showTrajectoryUnavailable();
+         }
+       }
+
+       function applyPerformance(model) {
+
         accuracyEl.setAttribute("aria-busy", "false");
         accuracyExplanationEl.textContent = "";
         accuracyComparisonEl.textContent = "";
@@ -388,10 +532,12 @@
         }
       }
 
-      refreshEl.addEventListener("click", loadForecast);
-      window.AirAwareDom = { loadForecast: loadForecast, loadPerformance: loadPerformance };
-      loadForecast();
-      loadPerformance();
+       refreshEl.addEventListener("click", function () { loadForecast(); loadTrajectory(); });
+       window.AirAwareDom = { loadForecast: loadForecast, loadTrajectory: loadTrajectory, loadPerformance: loadPerformance };
+       loadForecast();
+       loadTrajectory();
+       loadPerformance();
+
     })();
   </script>
 </body>
