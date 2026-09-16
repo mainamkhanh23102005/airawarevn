@@ -642,12 +642,10 @@ class ApiTests(unittest.TestCase):
             response = client.get("/")
 
         self.assertNotIn("AirAware status", response.text)
+
         self.assertNotIn("OpenAQ data", response.text)
         self.assertNotIn("data_mode", response.text)
-        self.assertNotIn("model_version", response.text)
-        self.assertNotIn("forecast_horizon_hours", response.text)
         self.assertNotIn("SQLite", response.text)
-        self.assertNotIn("sha256", response.text)
         self.assertNotIn("worker", response.text)
         self.assertNotIn('"/status"', response.text)
 
@@ -704,15 +702,19 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Forecast unavailable right now", response.text)
         self.assertNotIn("Previous readings hidden", response.text)
 
-    def test_webpage_no_forecast_curve(self):
+    def test_webpage_has_lightweight_accessible_trajectory_chart_without_framework(self):
         with self.client() as client:
             response = client.get("/")
 
+        self.assertIn('id="trajectory"', response.text)
+        self.assertIn('id="trajectory-chart"', response.text)
+        self.assertIn('role="img"', response.text)
+        self.assertIn('id="trajectory-list"', response.text)
+        self.assertIn('"/forecast/trajectory"', response.text)
         self.assertNotIn("<canvas", response.text)
-        self.assertNotIn("<svg", response.text)
-        self.assertNotIn("chart", response.text.lower())
         self.assertNotIn("plotly", response.text.lower())
         self.assertNotIn("d3", response.text.lower())
+
 
     def test_webpage_a11y(self):
         with self.client() as client:
@@ -735,8 +737,9 @@ class ApiTests(unittest.TestCase):
         self.assertIn('aria-busy="true"', html)
         self.assertIn("Loading forecast accuracy…", html)
         self.assertIn('"/consumer/forecast-performance"', html)
-        for internal in ("mature_issued_count", "published_at", "model_details", "model_version",
-                         "evaluation_policy_version", "sensor_id", "snapshot_id", "membership_sha256"):
+        for internal in ("mature_issued_count", "published_at", "model_details",
+                          "evaluation_policy_version", "sensor_id", "snapshot_id", "membership_sha256"):
+
             self.assertNotIn(internal, html)
 
     def webpage_scripts(self):
@@ -763,9 +766,11 @@ function makeEl() { return { textContent: "", attrs: {}, setAttribute(k, v) { th
 function ok(p) { return { ok: true, status: 200, json: async () => p }; }
 function err() { return { ok: false, status: 503, json: async () => ({ detail: "Forecast source is unavailable." }) }; }
 function pump() { return new Promise(r => setTimeout(r, 0)); }
-async function build(forecasts, performances) {
-   forecasts = forecasts || [];
-   performances = performances || [];
+async function build(forecasts, performances, trajectories) {
+    forecasts = forecasts || [];
+    performances = performances || [];
+    trajectories = trajectories || [];
+
    const sb = { console };
    sb.window = sb;
    const els = {};
@@ -773,7 +778,9 @@ async function build(forecasts, performances) {
    sb.urls = [];
    sb.fetch = async url => {
      sb.urls.push(url);
-     const queue = url === "/consumer/forecast-performance" ? performances : forecasts;
+      const queue = url === "/consumer/forecast-performance" ? performances :
+        url === "/forecast/trajectory" ? trajectories : forecasts;
+
      return queue.length ? queue.shift() : err();
    };
 
@@ -789,6 +796,10 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
    unit: "µg/m³", model_version: "v1", latest_completed_pm25: 24.0, history_start: "2025-02-01T00:00:00Z",
    history_end: "2025-02-02T00:00:00Z", data_mode: "fresh_openaq", source_retrieved_at: "2025-02-02T00:00:00Z",
    sensor_id: 13502151, freshness_status: "fresh", age_minutes: 0 };
+const TRAJECTORY = { schema_version: 1, model_version: "airaware-mh-v1", model_bundle_sha256: "a".repeat(64),
+  forecasts: [30, 45, 20, 35, 50, 40].map((predicted_pm25, index) => ({ forecast_horizon_hours: index + 1,
+    target_interval_start: new Date(Date.parse("2025-02-02T01:00:00Z") + index * 3600000).toISOString(),
+    target_interval_end: new Date(Date.parse("2025-02-02T02:00:00Z") + index * 3600000).toISOString(), predicted_pm25 })) };
 const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-05T17:00:00Z",
    range_end_utc: "2026-01-04T17:00:00Z", verified_count: 48, mature_issued_count: 48,
    model_mae: 3.2, persistence_mae: 4.6, mae_difference: 1.4, forecast_horizon_hours: 6,
@@ -860,9 +871,50 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
       freshness: sb.els["#freshness"].textContent, status: sb.els["#status"].textContent,
       busy: sb.els["#forecast"].attrs["aria-busy"] };
   }
-  {
-    const sb = await build([ok(VALID)], [ok(PERFORMANCE)]);
-    out.performanceAvailable = { summary: sb.els["#accuracy-summary"].textContent,
+   {
+     const sb = await build([ok(VALID)], [ok(PERFORMANCE)], [ok(TRAJECTORY)]);
+     out.trajectoryAvailable = {
+       horizons: V.buildTrajectoryModel(TRAJECTORY).model.points.map(point => point.horizon),
+       list: Array.from({ length: 6 }, (_, index) => sb.els["#trajectory-point-" + (index + 1)].textContent),
+       summary: sb.els["#trajectory-summary"].textContent,
+       direction: sb.els["#trajectory-direction"].textContent,
+       busy: sb.els["#trajectory"].attrs["aria-busy"],
+     };
+   }
+   {
+     const trajectory = (values) => ({ ...TRAJECTORY, forecasts: TRAJECTORY.forecasts.map((point, index) => ({ ...point, predicted_pm25: values[index] })) });
+     const names = ["stablePositive", "stableNegative", "improving", "worsening"];
+     const values = [[30, 30, 30, 30, 30, 30.049], [30, 30, 30, 30, 30, 29.951], [30, 30, 30, 30, 30, 29.95], [30, 30, 30, 30, 30, 30.05]];
+     out.trajectoryDirections = {};
+     for (let index = 0; index < names.length; index++) {
+       const sb = await build([ok(VALID)], [err()], [ok(trajectory(values[index]))]);
+       out.trajectoryDirections[names[index]] = sb.els["#trajectory-direction"].textContent;
+     }
+   }
+   {
+     const cases = [
+       { ...TRAJECTORY, forecasts: TRAJECTORY.forecasts.slice(0, 5) },
+       { ...TRAJECTORY, forecasts: [{ ...TRAJECTORY.forecasts[0], forecast_horizon_hours: 2 }, ...TRAJECTORY.forecasts.slice(1)] },
+       { ...TRAJECTORY, forecasts: [...TRAJECTORY.forecasts].reverse() },
+       { ...TRAJECTORY, forecasts: [{ ...TRAJECTORY.forecasts[0], predicted_pm25: "NaN" }, ...TRAJECTORY.forecasts.slice(1)] },
+       { ...TRAJECTORY, forecasts: [{ ...TRAJECTORY.forecasts[0], predicted_pm25: "30.0" }, ...TRAJECTORY.forecasts.slice(1)] },
+       { ...TRAJECTORY, forecasts: [{ ...TRAJECTORY.forecasts[0], target_interval_end: "2025-02-02T00:00:00Z" }, ...TRAJECTORY.forecasts.slice(1)] },
+       { ...TRAJECTORY, forecasts: [{ ...TRAJECTORY.forecasts[0], target_interval_end: "2025-02-02T03:00:00Z" }, ...TRAJECTORY.forecasts.slice(1)] },
+       { ...TRAJECTORY, schema_version: 2 }, { ...TRAJECTORY, model_version: " " },
+       { ...TRAJECTORY, model_bundle_sha256: " " }, { ...TRAJECTORY, model_bundle_sha256: "A".repeat(64) },
+     ];
+     out.trajectoryFailures = { malformedRejected: [], unavailable: "", status: "", forecast: "", accuracy: "" };
+     for (const malformed of cases) out.trajectoryFailures.malformedRejected.push(!V.buildTrajectoryModel(malformed).ok);
+     const sb = await build([ok(VALID)], [ok(PERFORMANCE)], [err()]);
+     out.trajectoryFailures.unavailable = sb.els["#trajectory-summary"].textContent;
+     out.trajectoryFailures.status = sb.els["#status"].textContent;
+     out.trajectoryFailures.forecast = sb.els["#forecast-pm25"].textContent;
+     out.trajectoryFailures.accuracy = sb.els["#accuracy-summary"].textContent;
+   }
+   {
+     const sb = await build([ok(VALID)], [ok(PERFORMANCE)]);
+     out.performanceAvailable = { summary: sb.els["#accuracy-summary"].textContent,
+
       explanation: sb.els["#accuracy-explanation"].textContent,
       comparison: sb.els["#accuracy-comparison"].textContent,
       evidence: sb.els["#accuracy-evidence"].textContent,
@@ -955,7 +1007,7 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
         performance = self.node_behaviors()["performanceAvailable"]
         self.assertEqual(performance["busy"], "false")
         self.assertEqual(performance["forecast"], "42.5")
-        self.assertEqual(performance["urls"], ["/forecast/current", "/consumer/forecast-performance"])
+        self.assertEqual(performance["urls"], ["/forecast/current", "/forecast/trajectory", "/consumer/forecast-performance"])
         self.assertEqual(performance["summary"], "Over the last 30 days, forecasts differed from verified PM2.5 readings by an average of 3.2 µg/m³.")
         self.assertEqual(performance["explanation"], "This is the mean absolute error (MAE): lower values mean forecasts were closer to the verified readings.")
         self.assertEqual(performance["comparison"], "Compared with using the latest reading alone, AirAware had 1.4 µg/m³ lower average error.")
@@ -1088,6 +1140,38 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
             self.assertEqual(absent["sensitive-guidance"], "")
             self.assertTrue(absent["hidden"])
             self.assertEqual(absent["status"], "Forecast updated.")
+
+    def test_trajectory_view_model_renders_six_ordered_points_with_target_times_and_summary(self):
+        trajectory = self.node_behaviors()["trajectoryAvailable"]
+        self.assertEqual(trajectory["horizons"], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(trajectory["list"], [
+            "+1h · 02 Feb 2025, 08:00 ICT · 30.0 µg/m³",
+            "+2h · 02 Feb 2025, 09:00 ICT · 45.0 µg/m³",
+            "+3h · 02 Feb 2025, 10:00 ICT · 20.0 µg/m³",
+            "+4h · 02 Feb 2025, 11:00 ICT · 35.0 µg/m³",
+            "+5h · 02 Feb 2025, 12:00 ICT · 50.0 µg/m³",
+            "+6h · 02 Feb 2025, 13:00 ICT · 40.0 µg/m³",
+        ])
+        self.assertEqual(trajectory["summary"], "Peak 50.0 µg/m³ at 02 Feb 2025, 12:00 ICT. Lowest 20.0 µg/m³ at 02 Feb 2025, 10:00 ICT. Worsening overall.")
+        self.assertEqual(trajectory["direction"], "Worsening overall.")
+        self.assertEqual(trajectory["busy"], "false")
+
+    def test_trajectory_view_model_matches_airaware_trend_threshold_boundaries(self):
+        directions = self.node_behaviors()["trajectoryDirections"]
+        self.assertEqual(directions, {
+            "stablePositive": "Stable overall.",
+            "stableNegative": "Stable overall.",
+            "improving": "Improving overall.",
+            "worsening": "Worsening overall.",
+        })
+
+    def test_trajectory_view_model_rejects_malformed_atomic_responses_and_503_without_harming_current_or_performance(self):
+        failures = self.node_behaviors()["trajectoryFailures"]
+        self.assertTrue(all(failures["malformedRejected"]))
+        self.assertEqual(failures["unavailable"], "Trajectory unavailable right now.")
+        self.assertEqual(failures["status"], "Forecast updated.")
+        self.assertEqual(failures["forecast"], "42.5")
+        self.assertIn("3.2 µg/m³", failures["accuracy"])
 
     def test_outlook_malformed_is_atomic_and_stale_error_recover(self):
         behaviors = self.node_behaviors()
