@@ -552,8 +552,9 @@ class ForecastLedgerTests(unittest.TestCase):
             ForecastRecord.create(**{**self.record.as_dict(), "forecast_id": None, "history_start": self.prediction_time - timedelta(hours=23)})
 
     def test_create_rejects_noncanonical_second_timestamp(self):
-        with self.assertRaises(ValueError):
-            ForecastRecord.create(**{**self.record.as_dict(), "forecast_id": None, "issued_at": self.record.issued_at + timedelta(microseconds=1)})
+        for field in ("source_retrieved_at", "issued_at"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                ForecastRecord.create(**{**self.record.as_dict(), "forecast_id": None, field: getattr(self.record, field) + timedelta(microseconds=1)})
 
     @unittest.skipUnless(Path(".artifacts/models/airaware_v1.joblib").is_file(), "production artifact unavailable")
     def test_production_artifact_hash_uses_exact_bytes(self):
@@ -587,6 +588,23 @@ class ForecastLedgerTests(unittest.TestCase):
         store = SQLiteForecastStore(bad_database)
         store.initialize()
         self.assertEqual(store.count(), 0)
+
+    def test_issuer_normalizes_fractional_retrieval_and_now_without_changing_identity(self):
+        source = pd.DataFrame({"event_time": pd.date_range("2025-01-01T00:00:00Z", periods=60, freq="1h"), "pm25": [float(value) for value in range(60)]})
+        model, metadata = train_v1_model(build_v1_features(source, include_target=True).dropna())
+        model_path = self.root / "model.joblib"
+        save_artifact(model_path, model, metadata)
+        current_path = self.root / "current.json"
+        history = [{"event_time": (self.prediction_time - timedelta(hours=24-index)).isoformat(), "period_end_utc": (self.prediction_time - timedelta(hours=23-index)).isoformat(), "record_id": index, "sensor_id": 13502151, "unit": "µg/m³", "value": float(index + 1)} for index in range(24)]
+        retrieved_at = self.prediction_time + timedelta(seconds=35, microseconds=29976)
+        issued_at = self.prediction_time + timedelta(minutes=1, microseconds=456789)
+        current_path.write_text(json.dumps({"artifact_version": 1, "sensor_id": 13502151, "retrieved_at": retrieved_at.isoformat().replace("+00:00", "Z"), "normalized_records": history}), encoding="utf-8")
+        first = issue_forecast(self.database, model_path, current_path, now=lambda: issued_at)
+        second = issue_forecast(self.database, model_path, current_path, now=lambda: issued_at)
+        self.assertEqual((first.outcome, second.outcome), ("issued", "already_exists"))
+        self.assertEqual(first.record.source_retrieved_at, retrieved_at.replace(microsecond=0))
+        self.assertEqual(first.record.issued_at, issued_at.replace(microsecond=0))
+        self.assertEqual(first.record.forecast_id, second.record.forecast_id)
 
     def test_consumer_publication_empty_history_is_idempotent(self):
         store = SQLiteForecastStore(self.database)
