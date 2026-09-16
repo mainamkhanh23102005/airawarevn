@@ -1839,7 +1839,8 @@ def issue_forecast(database_path, model_path, current_pm25_path, now=lambda: dat
         model, metadata = load_artifact(model_path)
         _validate_metadata(metadata)
         artifact, retrieved_at = _load_current_artifact(Path(current_pm25_path))
-        issued_at = _utc(now(), "issued_at")
+        source_retrieved_at = _utc(retrieved_at.replace(microsecond=0), "source_retrieved_at")
+        issued_at = _utc(now().replace(microsecond=0), "issued_at")
         payload = _current_prediction_request(artifact, issued_at)
         prediction = _predict(model, metadata, payload)
         age = max(0.0, (issued_at - payload.prediction_time).total_seconds() / 60)
@@ -1848,7 +1849,7 @@ def issue_forecast(database_path, model_path, current_pm25_path, now=lambda: dat
             predicted_pm25=prediction, persistence_prediction=payload.history[-1].pm25, model_version=MODEL_VERSION,
             model_artifact_sha256=sha256_file(model_path), feature_schema_sha256=feature_schema_sha256(),
             artifact_version=artifact["artifact_version"], feature_configuration=metadata["feature_configuration"],
-            source_retrieved_at=retrieved_at, input_data_cutoff=payload.prediction_time,
+            source_retrieved_at=source_retrieved_at, input_data_cutoff=payload.prediction_time,
             history_start=payload.history[0].event_time, history_end=payload.history[-1].event_time,
             data_mode_at_issue="stale_openaq" if stale else "fresh_openaq",
             freshness_status_at_issue="stale" if stale else "fresh", source_age_minutes_at_issue=age, issued_at=issued_at)
