@@ -619,6 +619,18 @@ class ForecastLedgerTests(unittest.TestCase):
                           first.mature_issued_count), (False, "insufficient_history", 0, 0))
         self.assertIsNone(first.snapshot_id)
 
+    def test_consumer_publication_rejects_fractional_reference_and_published_timestamps(self):
+        store = SQLiteForecastStore(self.database)
+        store.initialize()
+        reference = datetime(2025, 2, 2, 20, 15, tzinfo=timezone.utc)
+        fractional = reference + timedelta(microseconds=1)
+        with self.assertRaisesRegex(ValueError, "reference_time must not contain fractional seconds"):
+            store.publish_consumer_performance(
+                "v1", "a" * 64, "b" * 64, 13502151, fractional, reference)
+        with self.assertRaisesRegex(ValueError, "published_at must not contain fractional seconds"):
+            store.publish_consumer_performance(
+                "v1", "a" * 64, "b" * 64, 13502151, reference, fractional)
+
     def test_consumer_publication_selects_and_persists_in_one_connection(self):
         class ConnectionCountingStore(SQLiteForecastStore):
             connection_count = 0
@@ -689,7 +701,7 @@ class ForecastLedgerTests(unittest.TestCase):
         reference = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)
         start = self._populate_verified(store, 47, reference)
         below = store.publish_consumer_performance(
-            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
         self.assertEqual(below.verified_count, 47)
         self.assertFalse(below.available)
         self.assertEqual(below.reason, "insufficient_history")
@@ -699,7 +711,7 @@ class ForecastLedgerTests(unittest.TestCase):
         self.assertIsNotNone(below.snapshot_id)
         self._evaluate_at(store, start + timedelta(hours=47))
         above = store.publish_consumer_performance(
-            "v1", "a" * 64, "b" * 64, 13502151, reference, reference, minimum_verified_count=48)
+            "v1", "a" * 64, "b" * 64, 13502151, reference, reference)
         self.assertEqual(above.verified_count, 48)
         self.assertTrue(above.available)
         self.assertIsNone(above.reason)

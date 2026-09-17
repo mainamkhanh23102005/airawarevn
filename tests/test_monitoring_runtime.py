@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,20 +14,30 @@ ICT = ZoneInfo("Asia/Ho_Chi_Minh")
 
 
 class MonitoringCycleTests(unittest.TestCase):
-    def test_cycle_runs_issuer_reconciliation_and_snapshot_worker_once(self):
+    def test_cycle_normalizes_paths_and_runs_issuer_reconciliation_and_snapshot_worker_once(self):
         issue = object()
         reconciliation = object()
         evaluation = object()
         store = Mock()
-        with patch.object(run_monitoring_cycle, "issue_forecast", return_value=issue) as issue_forecast, patch.object(
-                run_monitoring_cycle, "run_reconciliation", return_value=reconciliation) as reconcile, patch.object(
-                run_monitoring_cycle, "create_forecast_store", return_value=store) as create_store, patch.object(
-                run_monitoring_cycle, "materialize_available_evaluations", return_value=evaluation) as materialize:
-            result = run_monitoring_cycle.run_monitoring_cycle("ledger.sqlite3", "raw", "key", "model.joblib", "current.json")
+        with tempfile.TemporaryDirectory() as directory:
+            raw_directory = Path(directory) / "raw"
+
+            def reconcile_with_raw_directory(database, raw_directory, api_key, **kwargs):
+                raw_directory.mkdir(parents=True, exist_ok=True)
+                return reconciliation
+
+            with patch.object(run_monitoring_cycle, "issue_forecast", return_value=issue) as issue_forecast, patch.object(
+                    run_monitoring_cycle, "run_reconciliation", side_effect=reconcile_with_raw_directory) as reconcile, patch.object(
+                    run_monitoring_cycle, "create_forecast_store", return_value=store) as create_store, patch.object(
+                    run_monitoring_cycle, "materialize_available_evaluations", return_value=evaluation) as materialize:
+                result = run_monitoring_cycle.run_monitoring_cycle(
+                    "ledger.sqlite3", str(raw_directory), "key", "model.joblib", "current.json")
+            self.assertTrue(raw_directory.is_dir())
         self.assertEqual(result, (issue, reconciliation, evaluation))
-        issue_forecast.assert_called_once()
-        reconcile.assert_called_once()
-        create_store.assert_called_once_with("ledger.sqlite3")
+        self.assertEqual(issue_forecast.call_args.args[:3],
+            (Path("ledger.sqlite3"), Path("model.joblib"), Path("current.json")))
+        self.assertEqual(reconcile.call_args.args[:3], (Path("ledger.sqlite3"), raw_directory, "key"))
+        create_store.assert_called_once_with(Path("ledger.sqlite3"))
         store.initialize.assert_called_once()
         store.acquire_monitoring_lease.assert_not_called()
         store.release_monitoring_lease.assert_not_called()
@@ -54,7 +65,7 @@ class MonitoringCycleTests(unittest.TestCase):
                 now=lambda: reference, lease_owner_id="owner-a", lease_ttl_seconds=120)
 
         self.assertEqual(result, (issue, reconciliation, evaluation))
-        create_store.assert_called_once_with("ledger.sqlite3")
+        create_store.assert_called_once_with(Path("ledger.sqlite3"))
         store.initialize.assert_called_once()
         store.acquire_monitoring_lease.assert_called_once_with(
             run_monitoring_cycle.DEFAULT_MONITORING_LEASE_NAME, "owner-a", reference, 120)
@@ -143,11 +154,12 @@ class MonitoringCycleTests(unittest.TestCase):
             self.assertEqual(len(call.args), 1)
             self.assertEqual(call.kwargs, {})
 
-    def test_existing_model_passes_exact_configured_cohort_and_reference_now(self):
+    def test_existing_model_passes_exact_configured_cohort_and_canonical_reference_now(self):
         with tempfile.TemporaryDirectory() as directory:
             model_path = Path(directory) / "v1.joblib"
             model_path.write_bytes(b"model-bytes")
-            reference = datetime(2026, 1, 2, 3, 15, 0, tzinfo=ICT).astimezone(timezone.utc)
+            reference = datetime(2026, 1, 2, 3, 15, 0, 654321, tzinfo=ICT)
+            canonical_reference = reference.astimezone(timezone.utc).replace(microsecond=0)
             evaluation = object()
             store = Mock()
             with patch.object(run_monitoring_cycle, "issue_forecast"), patch.object(
@@ -173,8 +185,35 @@ class MonitoringCycleTests(unittest.TestCase):
                 "forecast_horizon_hours": run_monitoring_cycle.FORECAST_HORIZON_HOURS,
             }
             self.assertEqual(kwargs["consumer_cohort"], expected_cohort)
-            self.assertEqual(kwargs["now"], reference)
+            self.assertEqual(kwargs["now"], canonical_reference)
             self.assertEqual(kwargs["now"].tzinfo, timezone.utc)
+            self.assertEqual(kwargs["now"].microsecond, 0)
+
+    def test_fractional_clock_publishes_consumer_performance_with_canonical_reference_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "ledger.sqlite3"
+            model_path = Path(directory) / "v1.joblib"
+            model_path.write_bytes(b"model-bytes")
+            reference = datetime(2026, 1, 2, 3, 15, 0, 654321, tzinfo=ICT)
+            canonical_reference = reference.astimezone(timezone.utc).replace(microsecond=0)
+            issue = object()
+            reconciliation = object()
+            with patch.object(run_monitoring_cycle, "issue_forecast", return_value=issue), patch.object(
+                    run_monitoring_cycle, "run_reconciliation", return_value=reconciliation):
+                first = run_monitoring_cycle.run_monitoring_cycle(
+                    database, "raw", "key", model_path, "current.json", now=lambda: reference)
+                second = run_monitoring_cycle.run_monitoring_cycle(
+                    database, "raw", "key", model_path, "current.json", now=lambda: reference)
+            first_publication = first[2].consumer_publication
+            second_publication = second[2].consumer_publication
+            self.assertIsNotNone(first_publication)
+            self.assertEqual(first_publication.published_at, canonical_reference)
+            self.assertEqual(first_publication.reason, "insufficient_history")
+            self.assertEqual(first_publication.publication_id, second_publication.publication_id)
+            store = run_monitoring_cycle.create_forecast_store(database)
+            with closing(store._connect()) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM consumer_performance_publications").fetchone()[0]
+            self.assertEqual(count, 1)
 
     def test_before_gate_now_suppresses_consumer_publication_via_materializer(self):
         with tempfile.TemporaryDirectory() as directory:
