@@ -284,7 +284,12 @@
       function buildPerformanceModel(data) {
         var source = data && typeof data === "object" ? data : {};
         if (source.available === false) {
-          if (source.reason === "insufficient_history") return { state: "insufficient_history" };
+          if (source.reason === "insufficient_history") {
+            var collected = finiteValue(source.verified_count);
+            return Number.isInteger(collected) && collected >= 0
+              ? { state: "insufficient_history", verifiedCount: collected }
+              : { state: "reporting_unavailable" };
+          }
           if (source.reason === "publication_unavailable") return { state: "publication_unavailable" };
           return { state: "reporting_unavailable" };
         }
@@ -492,7 +497,10 @@
           return;
         }
         if (model.state === "insufficient_history") {
-          accuracySummaryEl.textContent = "Accuracy results are not ready yet. AirAware needs more verified forecasts before showing this summary.";
+          accuracySummaryEl.textContent = "Collecting production evidence";
+          accuracyExplanationEl.textContent = model.verifiedCount + " / 48 verified forecasts";
+          accuracyComparisonEl.textContent = "Model MAE: Not available yet. Persistence MAE: Not available yet.";
+          accuracyEvidenceEl.textContent = "Accuracy metrics will appear automatically after enough verified +6h forecasts have accumulated.";
           return;
         }
         if (model.state === "publication_unavailable") {

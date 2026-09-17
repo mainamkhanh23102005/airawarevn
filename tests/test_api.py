@@ -797,6 +797,7 @@ const VALID = { prediction_time: "2025-02-02T00:00:00Z", target_interval_start: 
    history_end: "2025-02-02T00:00:00Z", data_mode: "fresh_openaq", source_retrieved_at: "2025-02-02T00:00:00Z",
    sensor_id: 13502151, freshness_status: "fresh", age_minutes: 0 };
 const TRAJECTORY = { schema_version: 1, model_version: "airaware-mh-v1", model_bundle_sha256: "a".repeat(64),
+  freshness_status: "fresh", data_mode: "fresh_openaq",
   forecasts: [30, 45, 20, 35, 50, 40].map((predicted_pm25, index) => ({ forecast_horizon_hours: index + 1,
     target_interval_start: new Date(Date.parse("2025-02-02T01:00:00Z") + index * 3600000).toISOString(),
     target_interval_end: new Date(Date.parse("2025-02-02T02:00:00Z") + index * 3600000).toISOString(), predicted_pm25 })) };
@@ -921,7 +922,32 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
       busy: sb.els["#accuracy"].attrs["aria-busy"], forecast: sb.els["#forecast-pm25"].textContent,
       urls: sb.urls };
   }
-  for (const reason of ["insufficient_history", "publication_unavailable", "reporting_unavailable"]) {
+  const COLLECTING = { available: false, reason: "insufficient_history", verified_count: 1,
+    mature_issued_count: 1, model_mae: null, persistence_mae: null, mae_difference: null,
+    forecast_horizon_hours: 6, model_details: { model_version: "v1", evaluation_policy_version: 1 } };
+  {
+    const sb = await build([ok(VALID)], [ok(PERFORMANCE), ok(COLLECTING)], [ok(TRAJECTORY)]);
+    await sb.AirAwareDom.loadPerformance();
+    out.collecting = { summary: sb.els["#accuracy-summary"].textContent,
+      explanation: sb.els["#accuracy-explanation"].textContent,
+      comparison: sb.els["#accuracy-comparison"].textContent,
+      evidence: sb.els["#accuracy-evidence"].textContent,
+      busy: sb.els["#accuracy"].attrs["aria-busy"], forecast: sb.els["#forecast-pm25"].textContent,
+      trajectoryHidden: sb.els["#trajectory-chart"].hidden,
+      trajectorySummary: sb.els["#trajectory-summary"].textContent,
+      trajectoryPoints: Array.from({ length: 6 }, (_, index) => sb.els["#trajectory-point-" + (index + 1)].textContent) };
+    out.collectingCounts = [];
+    for (const count of [0, 47]) {
+      const progress = await build([ok(VALID)], [ok({ ...COLLECTING, verified_count: count })]);
+      out.collectingCounts.push(progress.els["#accuracy-explanation"].textContent);
+    }
+    out.malformedCollecting = [];
+    for (const count of [null, undefined, -1, 1.5, "NaN", false]) {
+      const malformed = await build([ok(VALID)], [ok({ ...COLLECTING, verified_count: count })]);
+      out.malformedCollecting.push(malformed.els["#accuracy-summary"].textContent);
+    }
+  }
+  for (const reason of ["publication_unavailable", "reporting_unavailable", "unexpected_failure"]) {
     const sb = await build([ok(VALID)], [ok({ available: false, reason })]);
     out[reason] = { summary: sb.els["#accuracy-summary"].textContent,
       explanation: sb.els["#accuracy-explanation"].textContent, busy: sb.els["#accuracy"].attrs["aria-busy"] };
@@ -1019,12 +1045,37 @@ const PERFORMANCE = { available: true, reason: null, range_start_utc: "2025-12-0
         self.assertEqual(comparisons["negative"], "Compared with using the latest reading alone, AirAware had 1.4 µg/m³ higher average error.")
         self.assertNotIn("improvement", comparisons["negative"].lower())
 
+    def test_performance_view_model_collects_real_counts_without_fabricating_mae(self):
+        behaviors = self.node_behaviors()
+        progress = behaviors["collecting"]
+        self.assertEqual(progress["summary"], "Collecting production evidence")
+        self.assertEqual(progress["explanation"], "1 / 48 verified forecasts")
+        self.assertEqual(progress["comparison"], "Model MAE: Not available yet. Persistence MAE: Not available yet.")
+        self.assertEqual(progress["evidence"], "Accuracy metrics will appear automatically after enough verified +6h forecasts have accumulated.")
+        self.assertEqual(progress["busy"], "false")
+        for numeric in ("0.0", "3.2", "4.6", "1.4", "null", "NaN"):
+            self.assertNotIn(numeric, progress["comparison"])
+        self.assertEqual(behaviors["collectingCounts"], ["0 / 48 verified forecasts", "47 / 48 verified forecasts"])
+
+    def test_trajectory_remains_visible_while_accuracy_collects_evidence(self):
+        behaviors = self.node_behaviors()
+        progress = behaviors["collecting"]
+        trajectory = behaviors["trajectoryAvailable"]
+        self.assertFalse(progress["trajectoryHidden"])
+        self.assertEqual(progress["trajectorySummary"], trajectory["summary"])
+        self.assertEqual(progress["trajectoryPoints"], trajectory["list"])
+        self.assertEqual(progress["forecast"], "42.5")
+
+    def test_performance_view_model_rejects_malformed_collecting_counts(self):
+        for summary in self.node_behaviors()["malformedCollecting"]:
+            self.assertEqual(summary, "Forecast accuracy is unavailable right now.")
+
     def test_performance_view_model_handles_all_unavailable_states(self):
         behaviors = self.node_behaviors()
-        self.assertEqual(behaviors["insufficient_history"]["summary"], "Accuracy results are not ready yet. AirAware needs more verified forecasts before showing this summary.")
         self.assertEqual(behaviors["publication_unavailable"]["summary"], "Forecast accuracy summary is not available yet.")
         self.assertEqual(behaviors["reporting_unavailable"]["summary"], "Forecast accuracy is unavailable right now.")
-        for state in ("insufficient_history", "publication_unavailable", "reporting_unavailable"):
+        self.assertEqual(behaviors["unexpected_failure"]["summary"], "Forecast accuracy is unavailable right now.")
+        for state in ("publication_unavailable", "reporting_unavailable", "unexpected_failure"):
             self.assertEqual(behaviors[state]["explanation"], "")
             self.assertEqual(behaviors[state]["busy"], "false")
 
