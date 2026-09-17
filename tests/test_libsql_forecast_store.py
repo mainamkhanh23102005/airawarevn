@@ -289,6 +289,79 @@ class LibSQLForecastStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
             self.store.validate_existing()
 
+    def _trigger_sql_for(self, connection, operation):
+        row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (f"observation_raw_evidence_no_{operation.lower()}",)).fetchone()
+        self.assertIsNotNone(row)
+        return row[0]
+
+    def _validate_with_reformatted_triggers(self, operation, reformat):
+        self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            original = self._trigger_sql_for(connection, operation)
+            connection.execute(f"DROP TRIGGER observation_raw_evidence_no_{operation.lower()}")
+            connection.execute(reformat(original))
+            connection.commit()
+        self.store.validate_existing()
+
+    def test_validate_accepts_turso_style_trigger_formatting(self):
+        def reformat(sql):
+            return (sql.replace("raw_payload_sha256=NEW.raw_payload_sha256", "raw_payload_sha256 = NEW.raw_payload_sha256")
+                .replace("rowid=NEW.rowid", "rowid = NEW.rowid")
+                .replace("RAISE(ABORT", "RAISE (ABORT"))
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            with self.subTest(operation=operation):
+                self._validate_with_reformatted_triggers(operation, reformat)
+
+    def test_validate_rejects_structurally_modified_trigger(self):
+        self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            original = self._trigger_sql_for(connection, "UPDATE")
+            connection.execute("DROP TRIGGER observation_raw_evidence_no_update")
+            connection.execute(original.replace("RAISE(ABORT, 'raw evidence is append-only')", "RAISE (ROLLBACK, 'different message')"))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
+            self.store.validate_existing()
+
+    def test_validate_rejects_trigger_with_changed_operation(self):
+        self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            original = self._trigger_sql_for(connection, "DELETE")
+            connection.execute("DROP TRIGGER observation_raw_evidence_no_delete")
+            connection.execute(original.replace("BEFORE DELETE", "BEFORE UPDATE"))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
+            self.store.validate_existing()
+
+    def test_validate_rejects_trigger_with_changed_condition(self):
+        self.store.initialize()
+        with closing(self.store._connect()) as connection:
+            original = self._trigger_sql_for(connection, "INSERT")
+            connection.execute("DROP TRIGGER observation_raw_evidence_no_insert")
+            connection.execute(original.replace("OR rowid=NEW.rowid", "OR rowid=OLD.rowid"))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema"):
+            self.store.validate_existing()
+
+    def test_canonicalize_sql_normalizes_whitespace_outside_quotes(self):
+        for sql, expected in (
+                ("RAISE(ABORT,  'raw  evidence')", ("RAISE", "(", "ABORT", ",", "'raw  evidence'", ")")),
+                ("raw_payload_sha256 = NEW.raw_payload_sha256", ("raw_payload_sha256", "=", "NEW", ".", "raw_payload_sha256")),
+                ("a='don''t' AND b=2", ("a", "=", "'don''t'", "AND", "b", "=", "2")),
+                ('x = "a  b"  AND  y=1', ("x", "=", '"a  b"', "AND", "y", "=", "1")),
+                ("p='' AND q=1", ("p", "=", "''", "AND", "q", "=", "1")),
+                ("", ())):
+            with self.subTest(sql=sql):
+                self.assertEqual(LibSQLForecastStore._canonicalize_sql(sql), expected)
+
+    def test_canonicalize_sql_tokens_match_across_equivalent_formatting(self):
+        for left, right in (
+                ("RAISE(ABORT, 'raw evidence is append-only')", "RAISE (ABORT, 'raw evidence is append-only')"),
+                ("a=NEW.x OR rowid=NEW.rowid", "a = NEW.x OR rowid = NEW.rowid"),
+                ("GLOB '*[^0-9a-f]*'", "GLOB '*[^0-9a-f]*'")):
+            with self.subTest(sql=left):
+                self.assertEqual(LibSQLForecastStore._canonicalize_sql(left), LibSQLForecastStore._canonicalize_sql(right))
+
     def test_read_only_store_validates_and_reads_without_mutating(self):
         self.store.initialize()
         record = _forecast()
