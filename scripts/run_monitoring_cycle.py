@@ -28,7 +28,7 @@ def _run_monitoring_work(database, raw_directory, api_key, model_path, current_p
     if store is None:
         store = create_forecast_store(database)
         store.initialize()
-    reference = now().astimezone(timezone.utc)
+    reference = now().astimezone(timezone.utc).replace(microsecond=0)
     if Path(model_path).is_file():
         evaluation = materialize_available_evaluations(store, consumer_cohort={
             "model_version": MODEL_VERSION,
@@ -46,6 +46,11 @@ def _run_monitoring_work(database, raw_directory, api_key, model_path, current_p
 def run_monitoring_cycle(database, raw_directory, api_key, model_path=DEFAULT_MODEL_PATH,
                          current_pm25_path=DEFAULT_CURRENT_PM25_PATH, now=lambda: datetime.now(timezone.utc),
                          lease_owner_id=None, lease_ttl_seconds=DEFAULT_MONITORING_LEASE_TTL_SECONDS):
+    database = Path(database)
+    raw_directory = Path(raw_directory)
+    model_path = Path(model_path)
+    current_pm25_path = Path(current_pm25_path)
+
     if lease_owner_id is None:
         return _run_monitoring_work(database, raw_directory, api_key, model_path, current_pm25_path, now)
 
