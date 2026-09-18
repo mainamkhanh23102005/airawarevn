@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +21,13 @@ DEFAULT_MONITORING_LEASE_TTL_SECONDS = 3600
 
 class MonitoringLeaseUnavailable(RuntimeError):
     pass
+
+
+def _monitoring_lease_owner_id():
+    configured = os.environ.get("AIRAWARE_MONITORING_LEASE_OWNER_ID", "").strip()
+    if configured:
+        return configured
+    return f"local-{os.getpid()}-{uuid.uuid4().hex}"
 
 
 def _run_monitoring_work(database, raw_directory, api_key, model_path, current_pm25_path, now, store=None):
@@ -86,7 +94,8 @@ def main():
         raise SystemExit("AIRAWARE_FORECAST_LEDGER_PATH, AIRAWARE_RECONCILIATION_RAW_DIRECTORY, and OPENAQ_API_KEY are required")
     issue, reconciliation, evaluation = run_monitoring_cycle(database, raw_directory, api_key,
         os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH),
-        os.environ.get("AIRAWARE_CURRENT_PM25_ARTIFACT_PATH", DEFAULT_CURRENT_PM25_PATH))
+        os.environ.get("AIRAWARE_CURRENT_PM25_ARTIFACT_PATH", DEFAULT_CURRENT_PM25_PATH),
+        lease_owner_id=_monitoring_lease_owner_id())
     print(json.dumps({"issue": issue.outcome, "reconciliation": reconciliation.counts,
         "evaluation": evaluation.counts, "snapshots": len(evaluation.snapshot_results)},
         sort_keys=True, separators=(",", ":")))

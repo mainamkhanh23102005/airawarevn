@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from contextlib import closing
@@ -14,6 +15,48 @@ ICT = ZoneInfo("Asia/Ho_Chi_Minh")
 
 
 class MonitoringCycleTests(unittest.TestCase):
+    @staticmethod
+    def _successful_cycle_result():
+        issue = Mock(outcome="issued")
+        reconciliation = Mock(counts={})
+        evaluation = Mock(counts={}, snapshot_results=[])
+        return issue, reconciliation, evaluation
+
+    def test_main_passes_configured_monitoring_lease_owner(self):
+        environment = {
+            "AIRAWARE_FORECAST_LEDGER_PATH": "ledger.sqlite3",
+            "AIRAWARE_RECONCILIATION_RAW_DIRECTORY": "raw",
+            "OPENAQ_API_KEY": "key",
+            "AIRAWARE_MONITORING_LEASE_OWNER_ID": "github-12345",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+                run_monitoring_cycle, "run_monitoring_cycle",
+                return_value=self._successful_cycle_result()) as run_cycle:
+            self.assertEqual(run_monitoring_cycle.main(), 0)
+
+        self.assertEqual(run_cycle.call_args.kwargs["lease_owner_id"], "github-12345")
+
+    def test_main_generates_unique_local_monitoring_lease_owner_when_unconfigured(self):
+        environment = {
+            "AIRAWARE_FORECAST_LEDGER_PATH": "ledger.sqlite3",
+            "AIRAWARE_RECONCILIATION_RAW_DIRECTORY": "raw",
+            "OPENAQ_API_KEY": "key",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+                run_monitoring_cycle, "run_monitoring_cycle",
+                return_value=self._successful_cycle_result()) as run_cycle:
+            self.assertEqual(run_monitoring_cycle.main(), 0)
+            first_owner = run_cycle.call_args.kwargs["lease_owner_id"]
+            run_cycle.reset_mock()
+            self.assertEqual(run_monitoring_cycle.main(), 0)
+            second_owner = run_cycle.call_args.kwargs["lease_owner_id"]
+
+        self.assertTrue(first_owner)
+        self.assertTrue(second_owner)
+        self.assertTrue(first_owner.startswith(f"local-{os.getpid()}-"))
+        self.assertTrue(second_owner.startswith(f"local-{os.getpid()}-"))
+        self.assertNotEqual(first_owner, second_owner)
+
     def test_cycle_normalizes_paths_and_runs_issuer_reconciliation_and_snapshot_worker_once(self):
         issue = object()
         reconciliation = object()

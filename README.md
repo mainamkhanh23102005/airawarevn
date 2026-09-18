@@ -207,6 +207,23 @@ OPENAQ_API_KEY=<secret>
 
 `AIRAWARE_TURSO_AUTH_TOKEN` and `OPENAQ_API_KEY` remain environment-only. `AIRAWARE_REFRESH_ENABLED=1` starts one bounded in-process refresh loop in web service: refresh runs immediately on startup and, while service remains active, hourly; failures preserve last good artifact and next scheduled attempt still runs. Render free spin-down suspends process and hourly cadence until next request wakes service. Keep one Uvicorn worker; multiple workers would duplicate OpenAQ requests. Current V1 live data is local JSON, so Render's ephemeral filesystem loses it on restart, causing immediate re-fetch, and separate Render cron services cannot share it with web service. Durable history or horizontal scaling requires shared object storage or database. Local systemd behavior remains unchanged because managed refresh is opt-in.
 
+## Production monitoring scheduler
+
+`.github/workflows/production-monitoring.yml` runs the production monitoring worker hourly at minute 15 on GitHub Actions and also supports manual `workflow_dispatch`. The production job is guarded to `refs/heads/main`, uses one concurrency group with `cancel-in-progress: false`, and never runs from `push` or `pull_request` events.
+
+Configure these repository Actions secrets:
+
+```text
+OPENAQ_API_KEY=<secret>
+AIRAWARE_TURSO_AUTH_TOKEN=<secret>
+```
+
+Each run checks out `main`, installs the Python 3.11 dependencies, downloads the canonical V1 artifact through `scripts.start_render.provision_model`, verifies SHA-256 `af27f76aca9dd637814f2a6c83d50ceb50fd1b7309762cfdf6898b2e94cb8605`, refreshes 72 hours of OpenAQ data for sensor `13502151` into `.artifacts/live`, then runs `python -m scripts.run_monitoring_cycle`. The worker uses the libsql backend and the production Turso URL; credentials stay in GitHub secrets.
+
+GitHub Actions sets `AIRAWARE_MONITORING_LEASE_OWNER_ID=github-${{ github.run_id }}`. Manual reruns of one workflow run therefore reuse the same lease owner, while different workflow runs use different owners. CLI execution outside GitHub Actions generates a unique local owner. Existing `production-monitoring` lease TTL remains 3600 seconds and deterministic forecast, reconciliation, evaluation, and publication identities make duplicate or retried invocations safe.
+
+Scheduled GitHub Actions execution is best-effort: a delayed or dropped schedule event is not backfilled. Model provisioning, OpenAQ refresh, or monitoring failures fail the job. Recovery is a manual workflow dispatch or rerun after the underlying issue is fixed.
+
 ## User-level systemd operation
 
 Repository-managed templates live in `deploy/systemd/`. Install rendered user units with:
