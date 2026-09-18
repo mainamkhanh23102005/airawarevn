@@ -1,0 +1,70 @@
+name: Production monitoring
+
+on:
+  schedule:
+    - cron: "15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airaware-production-monitoring
+  cancel-in-progress: false
+
+jobs:
+  monitoring:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AIRAWARE_LEDGER_BACKEND: libsql
+      AIRAWARE_FORECAST_LEDGER_PATH: .artifacts/forecast-ledger/forecasts.sqlite3
+      AIRAWARE_TURSO_DATABASE_URL: libsql://airaware-prod-mainamkhanh23102005.aws-ap-northeast-1.turso.io
+      AIRAWARE_MODEL_PATH: .artifacts/models/airaware_v1.joblib
+      AIRAWARE_MODEL_URL: https://github.com/mainamkhanh23102005/airawarevn/releases/download/model-v1.1.0/airaware_v1.joblib
+      AIRAWARE_MODEL_SHA256: af27f76aca9dd637814f2a6c83d50ceb50fd1b7309762cfdf6898b2e94cb8605
+      AIRAWARE_CURRENT_PM25_ARTIFACT_PATH: .artifacts/live/current_pm25.json
+      AIRAWARE_RECONCILIATION_RAW_DIRECTORY: .artifacts/monitoring/reconciliation_raw
+      AIRAWARE_MONITORING_LEASE_OWNER_ID: github-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-stage0.txt
+
+      - name: Provision canonical V1 model
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from scripts.start_render import provision_model
+
+          provision_model(
+              Path(os.environ["AIRAWARE_MODEL_PATH"]),
+              os.environ["AIRAWARE_MODEL_URL"],
+              os.environ["AIRAWARE_MODEL_SHA256"],
+          )
+          PY
+
+      - name: Refresh current PM2.5
+        env:
+          OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
+        run: |
+          python -m scripts.refresh_pm25 \
+            --sensor-id 13502151 \
+            --history-hours 72 \
+            --artifact-directory .artifacts/live
+
+      - name: Run production monitoring cycle
+        env:
+          OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
+          AIRAWARE_TURSO_AUTH_TOKEN: ${{ secrets.AIRAWARE_TURSO_AUTH_TOKEN }}
+        run: python -m scripts.run_monitoring_cycle
