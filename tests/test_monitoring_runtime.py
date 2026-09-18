@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
-from app.forecast_ledger import LedgerDatabaseError
+from app.forecast_ledger import LedgerDatabaseError, SQLiteForecastStore
 from scripts import run_monitoring_cycle
 
 
@@ -115,6 +115,28 @@ class MonitoringCycleTests(unittest.TestCase):
         issue_forecast.assert_called_once()
         store.release_monitoring_lease.assert_called_once_with(
             run_monitoring_cycle.DEFAULT_MONITORING_LEASE_NAME, "owner-a")
+
+    def test_leased_cycle_canonicalizes_fractional_current_time_before_real_lease_acquisition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "ledger.sqlite3"
+            store = SQLiteForecastStore(database)
+            reference = datetime(2026, 1, 2, 3, 15, 0, 654321, tzinfo=ICT)
+            canonical_reference = reference.astimezone(timezone.utc).replace(microsecond=0)
+            with patch.object(store, "acquire_monitoring_lease",
+                    wraps=store.acquire_monitoring_lease) as acquire_monitoring_lease, patch.object(
+                    run_monitoring_cycle, "issue_forecast", return_value=object()), patch.object(
+                    run_monitoring_cycle, "run_reconciliation", return_value=object()), patch.object(
+                    run_monitoring_cycle, "create_forecast_store", return_value=store), patch.object(
+                    run_monitoring_cycle, "materialize_available_evaluations", return_value=object()):
+                run_monitoring_cycle.run_monitoring_cycle(
+                    database, "raw", "key", lease_owner_id="owner-a", now=lambda: reference)
+
+            lease_now = acquire_monitoring_lease.call_args.args[2]
+            self.assertEqual(lease_now, canonical_reference)
+            self.assertEqual(lease_now.tzinfo, timezone.utc)
+            self.assertEqual(lease_now.microsecond, 0)
+            with self.assertRaisesRegex(ValueError, "now must not contain fractional seconds"):
+                store.acquire_monitoring_lease("strict-contract-check", "owner-b", reference, 120)
 
     def test_successful_leased_cycle_fails_if_lease_was_lost_before_release(self):
         store = Mock()
