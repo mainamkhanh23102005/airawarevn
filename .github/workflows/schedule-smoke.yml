@@ -1,0 +1,19 @@
+name: Schedule smoke test
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm scheduled trigger
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "time=$(date -u)"
