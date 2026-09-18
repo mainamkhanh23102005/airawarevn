@@ -64,8 +64,9 @@ def run_monitoring_cycle(database, raw_directory, api_key, model_path=DEFAULT_MO
 
     store = create_forecast_store(database)
     store.initialize()
+    lease_now = now().astimezone(timezone.utc).replace(microsecond=0)
     if not store.acquire_monitoring_lease(
-            DEFAULT_MONITORING_LEASE_NAME, lease_owner_id, now(), lease_ttl_seconds):
+            DEFAULT_MONITORING_LEASE_NAME, lease_owner_id, lease_now, lease_ttl_seconds):
         raise MonitoringLeaseUnavailable("monitoring cycle skipped: production-monitoring lease is already held")
 
     work_failed = False
