@@ -3,6 +3,7 @@ import importlib
 import json
 import math
 import os
+import re
 import sqlite3
 import unicodedata
 import uuid
@@ -675,6 +676,10 @@ class SQLiteForecastStore:
             {condition}
             BEGIN SELECT RAISE(ABORT, 'raw evidence is append-only'); END"""
 
+    @staticmethod
+    def _canonicalize_sql(sql):
+        return tuple(re.findall(r"""'(?:[^']|'')*'|"(?:[^"]|"")*"|\w+|[^\s]""", sql))
+
     def _validate_m10_schema(self, connection):
         info = list(connection.execute("PRAGMA table_info(observation_raw_evidence)"))
         schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='observation_raw_evidence'").fetchone()
@@ -690,7 +695,7 @@ class SQLiteForecastStore:
         for operation in ("INSERT", "UPDATE", "DELETE"):
             row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
                 (f"observation_raw_evidence_no_{operation.lower()}",)).fetchone()
-            if row is None or " ".join(row[0].split()) != " ".join(self._raw_evidence_trigger(operation).split()):
+            if row is None or self._canonicalize_sql(row[0]) != self._canonicalize_sql(self._raw_evidence_trigger(operation)):
                 raise RuntimeError("unsupported schema")
 
     @_translate_sqlite_errors
