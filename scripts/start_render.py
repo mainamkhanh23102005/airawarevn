@@ -7,18 +7,25 @@ import sys
 import urllib.request
 
 DEFAULT_MODEL_PATH = Path(".artifacts/models/airaware_v1.joblib")
+DEFAULT_MULTI_HORIZON_MODEL_PATH = Path(".artifacts/models/airaware-mh-v1.joblib")
 MAX_MODEL_BYTES = 50 * 1024 * 1024
 
 
-def provision_model(destination, url, expected_sha256):
+def provision_model(
+    destination,
+    url,
+    expected_sha256,
+    url_variable="AIRAWARE_MODEL_URL",
+    sha256_variable="AIRAWARE_MODEL_SHA256",
+):
     if destination.is_file():
         return destination
     if not url or not expected_sha256:
         raise RuntimeError(
-            "model artifact is absent; set AIRAWARE_MODEL_URL and AIRAWARE_MODEL_SHA256"
+            f"model artifact is absent; set {url_variable} and {sha256_variable}"
         )
     if len(expected_sha256) != 64 or any(character not in "0123456789abcdefABCDEF" for character in expected_sha256):
-        raise RuntimeError("AIRAWARE_MODEL_SHA256 must be a 64-character hexadecimal digest")
+        raise RuntimeError(f"{sha256_variable} must be a 64-character hexadecimal digest")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -45,12 +52,28 @@ def main():
     if not port or not port.isdigit() or not 1 <= int(port) <= 65535:
         raise RuntimeError("PORT must be an integer from 1 through 65535")
     destination = Path(os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH))
+    multi_horizon_destination = Path(
+        os.environ.get(
+            "AIRAWARE_MULTI_HORIZON_MODEL_PATH",
+            DEFAULT_MULTI_HORIZON_MODEL_PATH,
+        )
+    )
     provision_model(
         destination,
         os.environ.get("AIRAWARE_MODEL_URL"),
         os.environ.get("AIRAWARE_MODEL_SHA256"),
     )
+    provision_model(
+        multi_horizon_destination,
+        os.environ.get("AIRAWARE_MULTI_HORIZON_MODEL_URL"),
+        os.environ.get("AIRAWARE_MULTI_HORIZON_MODEL_SHA256"),
+        "AIRAWARE_MULTI_HORIZON_MODEL_URL",
+        "AIRAWARE_MULTI_HORIZON_MODEL_SHA256",
+    )
     os.environ["AIRAWARE_MODEL_PATH"] = str(destination)
+    os.environ["AIRAWARE_MULTI_HORIZON_MODEL_PATH"] = str(
+        multi_horizon_destination
+    )
     os.execv(
         sys.executable,
         [

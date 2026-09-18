@@ -10,9 +10,23 @@ services:
         value: 3.11.9
       - key: AIRAWARE_REFRESH_ENABLED
         value: "1"
+      - key: AIRAWARE_CURRENT_PM25_ARTIFACT_PATH
+        value: .artifacts/live/current_pm25.json
+      - key: AIRAWARE_LEDGER_BACKEND
+        value: libsql
+      - key: AIRAWARE_FORECAST_LEDGER_PATH
+        value: .artifacts/forecast-ledger/forecasts.sqlite3
+      - key: AIRAWARE_TURSO_DATABASE_URL
+        value: libsql://airaware-prod-mainamkhanh23102005.aws-ap-northeast-1.turso.io
+      - key: AIRAWARE_TURSO_AUTH_TOKEN
+        sync: false
       - key: OPENAQ_API_KEY
         sync: false
       - key: AIRAWARE_MODEL_URL
-        sync: false
+        value: https://github.com/mainamkhanh23102005/airawarevn/releases/download/model-v1.1.0/airaware_v1.joblib
       - key: AIRAWARE_MODEL_SHA256
-        sync: false
+        value: af27f76aca9dd637814f2a6c83d50ceb50fd1b7309762cfdf6898b2e94cb8605
+      - key: AIRAWARE_MULTI_HORIZON_MODEL_URL
+        value: https://github.com/mainamkhanh23102005/airawarevn/releases/download/model-mh-v1.0.0/airaware-mh-v1.joblib
+      - key: AIRAWARE_MULTI_HORIZON_MODEL_SHA256
+        value: 8fb851e64ba51c010d6869ecc0180585f832dae9f65c884a7cc8c018e8b6e505

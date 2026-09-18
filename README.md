@@ -187,19 +187,25 @@ Open <http://127.0.0.1:8000>.
 
 ## Render deployment
 
-`render.yaml` runs one Uvicorn web service on Render's `PORT` and binds to `0.0.0.0`. `scripts.start_render` requires a trusted, versioned model artifact: it uses an existing `AIRAWARE_MODEL_PATH`, or downloads `AIRAWARE_MODEL_URL` with a 30-second timeout, a 50 MiB limit, and mandatory `AIRAWARE_MODEL_SHA256` verification before startup. Keep model URL and digest in Render environment variables; never put credentials in URL or repository.
+`render.yaml` runs one Uvicorn web service on Render's `PORT` and binds to `0.0.0.0`. `scripts.start_render` provisions both trusted production model artifacts before startup: V1 through `AIRAWARE_MODEL_URL` / `AIRAWARE_MODEL_SHA256`, and the trajectory bundle through `AIRAWARE_MULTI_HORIZON_MODEL_URL` / `AIRAWARE_MULTI_HORIZON_MODEL_SHA256`. Each download uses a 30-second timeout, a 50 MiB limit, SHA-256 verification, and atomic replacement before its path is exported to the app.
 
-A fresh clone cannot build the model: both saved model and frozen training input are intentionally ignored. Train offline with the same scikit-learn version used for serving, publish resulting immutable `airaware_v1.joblib` to trusted storage, and configure URL and SHA-256. Render startup never fabricates or retrains model. `/forecast/latest` additionally needs the ignored frozen normalized PM2.5 input supplied through `AIRAWARE_PM25_ARTIFACT_PATH`; without it, that optional historical endpoint returns 503.
+Render uses the libsql forecast-store backend with the production Turso URL. `AIRAWARE_FORECAST_LEDGER_PATH` remains set as the app-level store activation switch; libsql ignores its local path value and connects through `AIRAWARE_TURSO_DATABASE_URL`. Configure `AIRAWARE_TURSO_AUTH_TOKEN` and `OPENAQ_API_KEY` as Render secrets; never put either credential in repository configuration.
+
+A fresh clone cannot build the production models: saved model artifacts and frozen training input are intentionally ignored. Train offline with the same scikit-learn version used for serving, publish immutable V1 and multi-horizon artifacts to trusted storage, and configure each URL and SHA-256. Render startup never fabricates or retrains models. `/forecast/latest` additionally needs the ignored frozen normalized PM2.5 input supplied through `AIRAWARE_PM25_ARTIFACT_PATH`; without it, that optional historical endpoint returns 503.
 
 Required Render variables:
 
 ```text
-AIRAWARE_MODEL_URL=https://trusted-storage.example/airaware_v1.joblib
-AIRAWARE_MODEL_SHA256=<64-character-sha256>
+AIRAWARE_MODEL_URL=https://github.com/mainamkhanh23102005/airawarevn/releases/download/model-v1.1.0/airaware_v1.joblib
+AIRAWARE_MODEL_SHA256=af27f76aca9dd637814f2a6c83d50ceb50fd1b7309762cfdf6898b2e94cb8605
+AIRAWARE_MULTI_HORIZON_MODEL_URL=https://github.com/mainamkhanh23102005/airawarevn/releases/download/model-mh-v1.0.0/airaware-mh-v1.joblib
+AIRAWARE_MULTI_HORIZON_MODEL_SHA256=8fb851e64ba51c010d6869ecc0180585f832dae9f65c884a7cc8c018e8b6e505
+AIRAWARE_TURSO_DATABASE_URL=libsql://airaware-prod-mainamkhanh23102005.aws-ap-northeast-1.turso.io
+AIRAWARE_TURSO_AUTH_TOKEN=<secret>
 OPENAQ_API_KEY=<secret>
 ```
 
-`OPENAQ_API_KEY` remains environment-only. `AIRAWARE_REFRESH_ENABLED=1` starts one bounded in-process refresh loop in web service: refresh runs immediately on startup and, while service remains active, hourly; failures preserve last good artifact and next scheduled attempt still runs. Render free spin-down suspends process and hourly cadence until next request wakes service. Keep one Uvicorn worker; multiple workers would duplicate OpenAQ requests. Current V1 live data is local JSON, so Render's ephemeral filesystem loses it on restart, causing immediate re-fetch, and separate Render cron services cannot share it with web service. Durable history or horizontal scaling requires shared object storage or database. Local systemd behavior remains unchanged because managed refresh is opt-in.
+`AIRAWARE_TURSO_AUTH_TOKEN` and `OPENAQ_API_KEY` remain environment-only. `AIRAWARE_REFRESH_ENABLED=1` starts one bounded in-process refresh loop in web service: refresh runs immediately on startup and, while service remains active, hourly; failures preserve last good artifact and next scheduled attempt still runs. Render free spin-down suspends process and hourly cadence until next request wakes service. Keep one Uvicorn worker; multiple workers would duplicate OpenAQ requests. Current V1 live data is local JSON, so Render's ephemeral filesystem loses it on restart, causing immediate re-fetch, and separate Render cron services cannot share it with web service. Durable history or horizontal scaling requires shared object storage or database. Local systemd behavior remains unchanged because managed refresh is opt-in.
 
 ## User-level systemd operation
 
