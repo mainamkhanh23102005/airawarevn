@@ -16,6 +16,18 @@ class ProductionMonitoringSchedulerTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
 
+    def test_runtime_pins_and_python_match_across_ci_monitoring_and_render(self):
+        expected = ["fastapi==0.141.1", "httpx==0.28.1", "joblib==1.6.0", "libsql==0.1.11",
+            "numpy==2.5.3", "pandas==3.0.5", "scikit-learn==1.9.1", "tzdata==2026.3", "uvicorn==0.52.4"]
+        self.assertEqual((ROOT / "requirements-stage0.txt").read_text().splitlines(), expected)
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        render = (ROOT / "render.yaml").read_text()
+        for workflow in (ci, self.workflow):
+            self.assertIn('python-version: "3.14.4"', workflow)
+            self.assertIn("python -m pip install -r requirements-stage0.txt", workflow)
+        self.assertIn("buildCommand: pip install -r requirements-stage0.txt", render)
+        self.assertIn("value: 3.14.4", render)
+
     def test_triggers_only_hourly_schedule_and_manual_dispatch(self):
         self.assertIn('cron: "15 * * * *"', self.workflow)
         self.assertEqual(self.workflow.count("cron:"), 1)
@@ -25,7 +37,7 @@ class ProductionMonitoringSchedulerTests(unittest.TestCase):
 
     def test_runner_permissions_concurrency_timeout_and_main_guard_are_pinned(self):
         self.assertIn("runs-on: ubuntu-latest", self.workflow)
-        self.assertIn('python-version: "3.11"', self.workflow)
+        self.assertIn('python-version: "3.14.4"', self.workflow)
         self.assertRegex(self.workflow, r"(?ms)^permissions:\s*\n\s+contents: read\s*$")
         self.assertNotRegex(self.workflow, r"(?m)^\s+[A-Za-z-]+:\s+write\s*$")
         self.assertIn("group: airaware-production-monitoring", self.workflow)

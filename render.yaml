@@ -7,7 +7,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.14.4
       - key: AIRAWARE_REFRESH_ENABLED
         value: "1"
       - key: AIRAWARE_CURRENT_PM25_ARTIFACT_PATH

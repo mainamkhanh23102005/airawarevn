@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -21,6 +23,64 @@ class MonitoringCycleTests(unittest.TestCase):
         reconciliation = Mock(counts={})
         evaluation = Mock(counts={}, snapshot_results=[])
         return issue, reconciliation, evaluation
+
+    def _main_summary(self, issue_outcome="issued", evaluation_counts=None, snapshots=(), reconciliation_counts=None):
+        environment = {
+            "AIRAWARE_FORECAST_LEDGER_PATH": "ledger.sqlite3",
+            "AIRAWARE_RECONCILIATION_RAW_DIRECTORY": "raw",
+            "OPENAQ_API_KEY": "key",
+        }
+        result = (Mock(outcome=issue_outcome), Mock(counts=reconciliation_counts or {}),
+            Mock(counts=evaluation_counts or {}, snapshot_results=snapshots))
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+                run_monitoring_cycle, "run_monitoring_cycle", return_value=result), patch(
+                "sys.stdout", new_callable=io.StringIO) as output:
+            status = run_monitoring_cycle.main()
+        return status, json.loads(output.getvalue())
+
+    def test_required_not_eligible_issuance_is_actionable_failure(self):
+        status, summary = self._main_summary(issue_outcome="not_eligible")
+        self.assertEqual(status, 1)
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["issue"], "not_eligible")
+        self.assertIn("24 contiguous completed hourly intervals", summary["issue_action"])
+
+    def test_issued_and_already_exists_remain_successful(self):
+        for outcome in ("issued", "already_exists"):
+            with self.subTest(outcome=outcome):
+                status, summary = self._main_summary(issue_outcome=outcome)
+                self.assertEqual(status, 0)
+                self.assertEqual(summary["status"], "ok")
+                self.assertIsNone(summary["issue_action"])
+
+    def test_snapshot_failures_fail_cycle_without_evaluation_failures(self):
+        for forecast_id in ("forecast-id", None):
+            for reason in ("database_error", "integrity_error"):
+                with self.subTest(forecast_id=forecast_id, reason=reason):
+                    status, summary = self._main_summary(snapshots=(
+                        (forecast_id, "failed", reason), ("other", "inserted", "snapshot-id")))
+                    self.assertEqual(status, 1)
+                    self.assertEqual(summary["status"], "failed")
+                    self.assertEqual(summary["evaluation"], {})
+                    self.assertEqual(summary["snapshots"], 2)
+                    self.assertEqual(summary["snapshot_counts"], {"failed": 1, "inserted": 1})
+                    self.assertEqual(summary["snapshot_failures"], [
+                        {"forecast_id": forecast_id, "reason": reason}])
+
+    def test_existing_required_stage_failures_remain_nonzero(self):
+        for kwargs in ({"issue_outcome": "failed"}, {"evaluation_counts": {"failed": 1}},
+                       {"reconciliation_counts": {"failed": 1}}):
+            with self.subTest(kwargs=kwargs):
+                status, summary = self._main_summary(**kwargs)
+                self.assertEqual(status, 1)
+                self.assertEqual(summary["status"], "failed")
+
+    def test_successful_snapshot_outcomes_do_not_fail_cycle(self):
+        status, summary = self._main_summary(snapshots=(
+            ("first", "inserted", "snapshot-a"), (None, "already_exists", "snapshot-b")))
+        self.assertEqual(status, 0)
+        self.assertEqual(summary["snapshot_counts"], {"inserted": 1, "already_exists": 1})
+        self.assertEqual(summary["snapshot_failures"], [])
 
     def test_main_passes_configured_monitoring_lease_owner(self):
         environment = {
