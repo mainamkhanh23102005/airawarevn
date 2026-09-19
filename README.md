@@ -130,6 +130,10 @@ The API loads the saved V1 model once at startup. `/forecast/current` reads the 
 
 ### 1. Install
 
+Use Python **3.14.4**, matching CI, production monitoring, and Render. All three install the same exact direct runtime pins from `requirements-stage0.txt`. These pins were copied without upgrades from the validated WSL environment at `/mnt/d/Dev/Projects/airaware-vn/airaware-vn/.venv-wsl-main/bin/python`: FastAPI 0.141.1, HTTPX 0.28.1, joblib 1.6.0, libsql 0.1.11, NumPy 2.5.3, pandas 3.0.5, scikit-learn 1.9.1, tzdata 2026.3, and Uvicorn 0.52.4. This is a direct-dependency pin set, not a transitive lockfile.
+
+Canonical artifact compatibility was checked with that interpreter: both release downloads passed the unchanged SHA-256 values below; V1 passed `load_artifact` and API metadata validation, and the trajectory bundle passed `load_bundle`, including its exact scikit-learn version check. The bundle records training Python 3.12.10 and scikit-learn 1.9.1; successful loading on serving Python 3.14.4 does not imply support for arbitrary Python or dependency versions. No model was retrained or republished. For future runtime changes, repeat hash verification and both loader checks before deployment; a passing unit suite alone does not validate production pickle compatibility.
+
 ```bash
 git clone https://github.com/mainamkhanh23102005/airawarevn.git airaware-vn
 cd airaware-vn
@@ -218,9 +222,11 @@ OPENAQ_API_KEY=<secret>
 AIRAWARE_TURSO_AUTH_TOKEN=<secret>
 ```
 
-Each run checks out `main`, installs the Python 3.11 dependencies, downloads the canonical V1 artifact through `scripts.start_render.provision_model`, verifies SHA-256 `af27f76aca9dd637814f2a6c83d50ceb50fd1b7309762cfdf6898b2e94cb8605`, refreshes 72 hours of OpenAQ data for sensor `13502151` into `.artifacts/live`, then runs `python -m scripts.run_monitoring_cycle`. The worker uses the libsql backend and the production Turso URL; credentials stay in GitHub secrets.
+Each run checks out `main`, installs the pinned Python 3.14.4 runtime dependencies, downloads the canonical V1 artifact through `scripts.start_render.provision_model`, verifies SHA-256 `af27f76aca9dd637814f2a6c83d50ceb50fd1b7309762cfdf6898b2e94cb8605`, refreshes 72 hours of OpenAQ data for sensor `13502151` into `.artifacts/live`, then runs `python -m scripts.run_monitoring_cycle`. The worker uses the libsql backend and the production Turso URL; credentials stay in GitHub secrets.
 
 GitHub Actions sets `AIRAWARE_MONITORING_LEASE_OWNER_ID=github-${{ github.run_id }}`. Manual reruns of one workflow run therefore reuse the same lease owner, while different workflow runs use different owners. CLI execution outside GitHub Actions generates a unique local owner. Existing `production-monitoring` lease TTL remains 3600 seconds and deterministic forecast, reconciliation, evaluation, and publication identities make duplicate or retried invocations safe.
+
+Monitoring requires issuance: `issued` and `already_exists` succeed, while `not_eligible` returns nonzero with an `issue_action` directing operators to check refresh output for 24 contiguous completed hourly intervals. The JSON summary includes overall `status`, separate `evaluation` and `snapshot_counts`, and `snapshot_failures` with forecast ID (null for aggregate windows) and sanitized reason codes. `snapshots` remains the number of attempted snapshot results, not a success count. Any reported reconciliation, evaluation, or snapshot failure makes the cycle nonzero; empty pending evaluation/snapshot queues are successful no-ops. Repair the underlying data or store issue before rerunning; existing deterministic identities preserve idempotency.
 
 Scheduled GitHub Actions execution is best-effort: a delayed or dropped schedule event is not backfilled. Model provisioning, OpenAQ refresh, or monitoring failures fail the job. Recovery is a manual workflow dispatch or rerun after the underlying issue is fixed.
 

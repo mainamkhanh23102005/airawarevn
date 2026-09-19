@@ -97,10 +97,24 @@ def main():
         os.environ.get("AIRAWARE_MODEL_PATH", DEFAULT_MODEL_PATH),
         os.environ.get("AIRAWARE_CURRENT_PM25_ARTIFACT_PATH", DEFAULT_CURRENT_PM25_PATH),
         lease_owner_id=_monitoring_lease_owner_id())
-    print(json.dumps({"issue": issue.outcome, "reconciliation": reconciliation.counts,
-        "evaluation": evaluation.counts, "snapshots": len(evaluation.snapshot_results)},
+    snapshot_counts = {}
+    snapshot_failures = []
+    for forecast_id, status, detail in evaluation.snapshot_results:
+        snapshot_counts[status] = snapshot_counts.get(status, 0) + 1
+        if status == "failed":
+            snapshot_failures.append({"forecast_id": forecast_id, "reason": detail})
+    failed = (issue.outcome not in {"issued", "already_exists"}
+        or bool(evaluation.counts.get("failed")) or bool(reconciliation.counts.get("failed"))
+        or bool(snapshot_counts.get("failed")))
+    issue_action = None
+    if issue.outcome == "not_eligible":
+        issue_action = "Check OpenAQ refresh and current PM2.5 artifact for 24 contiguous completed hourly intervals; rerun monitoring after data is available."
+    print(json.dumps({"status": "failed" if failed else "ok", "issue": issue.outcome,
+        "issue_action": issue_action, "reconciliation": reconciliation.counts,
+        "evaluation": evaluation.counts, "snapshots": len(evaluation.snapshot_results),
+        "snapshot_counts": snapshot_counts, "snapshot_failures": snapshot_failures},
         sort_keys=True, separators=(",", ":")))
-    return 0 if issue.outcome != "failed" and not evaluation.counts.get("failed") and not reconciliation.counts.get("failed") else 1
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
