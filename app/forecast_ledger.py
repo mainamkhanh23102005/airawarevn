@@ -26,6 +26,8 @@ SCHEMA_VERSION = 10
 MAX_RAW_EVIDENCE_BYTES = 2 * 1024 * 1024
 DERIVED_ERROR_REL_TOL = 0
 DERIVED_ERROR_ABS_TOL = 1e-12
+SNAPSHOT_METRIC_REL_TOL = 0
+SNAPSHOT_METRIC_ABS_TOL = 1e-12
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -185,6 +187,14 @@ def _timestamp(value):
 def _derived_error_matches(stored, recomputed):
     return (isinstance(stored, (int, float)) and not isinstance(stored, bool) and math.isfinite(stored)
         and math.isclose(stored, recomputed, rel_tol=DERIVED_ERROR_REL_TOL, abs_tol=DERIVED_ERROR_ABS_TOL))
+
+
+def _snapshot_metric_matches(stored, recomputed):
+    return ((stored is None and recomputed is None) or (isinstance(stored, (int, float))
+        and not isinstance(stored, bool) and math.isfinite(stored) and isinstance(recomputed, (int, float))
+        and not isinstance(recomputed, bool) and math.isfinite(recomputed)
+        and math.isclose(stored, recomputed, rel_tol=SNAPSHOT_METRIC_REL_TOL,
+            abs_tol=SNAPSHOT_METRIC_ABS_TOL)))
 
 
 def _parse_timestamp(value):
@@ -482,6 +492,8 @@ class ForecastStore(Protocol):
                                      evaluation_policy_version=1, forecast_horizon_hours=6): ...
     def get_evaluation(self, forecast_id): ...
     def invalid_evaluation_rows(self): ...
+    def invalid_evaluation_run_snapshots(self): ...
+    def snapshot_metric_recomputation_diagnostics(self): ...
 
 
 class SQLiteForecastStore:
@@ -1501,7 +1513,8 @@ class SQLiteForecastStore:
             if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)) for value in values):
                 raise ValueError("invalid snapshot metrics")
             metrics = self._evaluation_metrics(rows)
-            if tuple(values) != tuple(metrics.__dict__.values())[1:]:
+            if not all(_snapshot_metric_matches(stored, recomputed)
+                    for stored, recomputed in zip(values, tuple(metrics.__dict__.values())[1:])):
                 raise ValueError("snapshot metrics conflict")
             identity = json.dumps({"snapshot_identity_version": 1, "evaluation_policy_version": row["evaluation_policy_version"],
                 "model_version": row["model_version"], "model_artifact_sha256": row["model_artifact_sha256"],
@@ -1687,6 +1700,65 @@ class SQLiteForecastStore:
                     self._validate_durable_evaluation_relationship(connection, row)
                 except ForecastIntegrityError:
                     reports.append(self._evaluation_diagnostic(connection, row))
+            return reports
+
+    def _snapshot_diagnostic(self, connection, row):
+        metric_names = ("model_mae", "model_rmse", "persistence_mae", "persistence_rmse",
+            "mae_improvement", "rmse_improvement", "mae_improvement_percent", "rmse_improvement_percent")
+        candidate = dict(row)
+        try:
+            evaluation_ids = json.loads(row["evaluation_ids_json"])
+            rows = []
+            for evaluation_id in evaluation_ids:
+                evaluation = connection.execute("SELECT * FROM evaluation_rows WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+                if evaluation is None:
+                    raise ValueError("missing snapshot evaluation")
+                rows.append(self._validate_durable_evaluation_relationship(connection, evaluation))
+            horizon = None if not rows else connection.execute("SELECT forecast_horizon_hours FROM forecasts WHERE forecast_id=?", (rows[0].forecast_id,)).fetchone()[0]
+            metrics = self._evaluation_metrics(rows)
+            recomputed = dict(zip(metric_names, tuple(metrics.__dict__.values())[1:]))
+            candidate.update(recomputed)
+            self._snapshot_row(connection, candidate)
+            identity_valid = True
+        except (TypeError, ValueError, ForecastIntegrityError, json.JSONDecodeError):
+            evaluation_ids = []
+            horizon = None
+            metrics = None
+            recomputed = {name: None for name in metric_names}
+            identity_valid = False
+        report = {"snapshot_id": row["snapshot_id"], "model_version": row["model_version"],
+            "horizon": horizon, "evaluation_policy_version": row["evaluation_policy_version"],
+            "evaluation_count": row["count"], "all_nonnumeric_identity_invariants_valid": identity_valid}
+        for name in metric_names:
+            stored = row[name]
+            value = recomputed[name]
+            report[f"stored_{name}"] = stored
+            report[f"recomputed_{name}"] = value
+            report[f"{name}_absolute_difference"] = (abs(stored - value) if isinstance(stored, (int, float))
+                and not isinstance(stored, bool) and math.isfinite(stored) and isinstance(value, (int, float))
+                and not isinstance(value, bool) and math.isfinite(value) else None)
+        return report
+
+    def invalid_evaluation_run_snapshots(self):
+        with closing(self._connect()) as connection:
+            reports = []
+            for row in connection.execute("SELECT * FROM evaluation_run_snapshots ORDER BY created_at, snapshot_id"):
+                try:
+                    self._snapshot_row(connection, row)
+                except ForecastIntegrityError:
+                    reports.append(self._snapshot_diagnostic(connection, row))
+            return reports
+
+    def snapshot_metric_recomputation_diagnostics(self):
+        with closing(self._connect()) as connection:
+            reports = []
+            for row in connection.execute("SELECT * FROM evaluation_run_snapshots ORDER BY created_at, snapshot_id"):
+                report = self._snapshot_diagnostic(connection, row)
+                metric_names = ("model_mae", "model_rmse", "persistence_mae", "persistence_rmse",
+                    "mae_improvement", "rmse_improvement", "mae_improvement_percent", "rmse_improvement_percent")
+                if report["all_nonnumeric_identity_invariants_valid"] and any(
+                        row[name] != report[f"recomputed_{name}"] for name in metric_names):
+                    reports.append(report)
             return reports
 
     def count_evaluations(self):

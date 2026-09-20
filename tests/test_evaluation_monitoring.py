@@ -1,3 +1,4 @@
+import math
 import tempfile
 import unittest
 from contextlib import closing
@@ -7,7 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.evaluation_monitor import materialize_available_evaluations
-from app.forecast_ledger import ForecastRecord, SQLiteForecastStore
+from app.forecast_ledger import ForecastIntegrityError, ForecastRecord, SQLiteForecastStore
 from app.ground_truth_reconciler import AcquisitionBatch, GroundTruthReconciler
 
 
@@ -186,6 +187,67 @@ class EvaluationMonitoringTests(unittest.TestCase):
             connection.commit()
         with self.assertRaisesRegex(Exception, "invalid durable evaluation row"):
             self.store.get_evaluation(row.forecast_id)
+
+    def test_snapshot_metrics_accept_only_strict_float_round_trip_differences(self):
+        row = self._evaluate(self.start, 12.1, 14.2, 10.3)
+        end = row.target_interval_end + timedelta(hours=1)
+        created = self.store.create_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end, end, self.start)
+        with closing(self.store._connect()) as connection:
+            stored = connection.execute("SELECT model_mae FROM evaluation_run_snapshots WHERE snapshot_id=?", (created.snapshot.snapshot_id,)).fetchone()[0]
+            connection.execute("UPDATE evaluation_run_snapshots SET model_mae=? WHERE snapshot_id=?", (math.nextafter(stored, math.inf), created.snapshot.snapshot_id))
+            connection.commit()
+        repeated = self.store.create_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end, end, self.start)
+        self.assertEqual(repeated.status, "already_exists")
+        reports = self.store.snapshot_metric_recomputation_diagnostics()
+        self.assertEqual(len(reports), 1)
+        self.assertLess(reports[0]["model_mae_absolute_difference"], 1e-12)
+
+    def test_repeated_consumer_publication_accepts_snapshot_float_round_trip_drift(self):
+        row = self._evaluate(self.start, 12.1, 14.2, 10.3)
+        now = datetime(2026, 1, 2, 3, 15, tzinfo=ICT)
+        first = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(), now=now)
+        snapshot_id = first.consumer_publication.snapshot_id
+        with closing(self.store._connect()) as connection:
+            stored = connection.execute("SELECT model_mae FROM evaluation_run_snapshots WHERE snapshot_id=?", (snapshot_id,)).fetchone()[0]
+            connection.execute("UPDATE evaluation_run_snapshots SET model_mae=? WHERE snapshot_id=?", (math.nextafter(stored, math.inf), snapshot_id))
+            connection.commit()
+        repeated = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(), now=now)
+        self.assertFalse(repeated.counts.get("failed"))
+        self.assertEqual(repeated.consumer_publication.snapshot_id, snapshot_id)
+
+    def test_snapshot_metrics_reject_material_drift_and_preserve_identity_validation(self):
+        row = self._evaluate(self.start, 12, 14, 10)
+        end = row.target_interval_end + timedelta(hours=1)
+        created = self.store.create_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end, end, self.start)
+        cases = (("model_mae", 2 + 1e-6), ("evaluation_ids_json", '[]'))
+        for column, value in cases:
+            with self.subTest(column=column), closing(self.store._connect()) as connection:
+                connection.execute(f"UPDATE evaluation_run_snapshots SET {column}=? WHERE snapshot_id=?", (value, created.snapshot.snapshot_id))
+                connection.commit()
+            with self.assertRaisesRegex(ForecastIntegrityError, "invalid durable snapshot"):
+                self.store.find_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end, end)
+            with closing(self.store._connect()) as connection:
+                connection.execute(f"UPDATE evaluation_run_snapshots SET {column}=? WHERE snapshot_id=?", ((2 if column == "model_mae" else f'["{row.evaluation_id}"]'), created.snapshot.snapshot_id))
+                connection.commit()
+
+    def test_snapshot_diagnostic_reports_only_numeric_metric_drift(self):
+        row = self._evaluate(self.start, 12.1, 14.2, 10.3)
+        end = row.target_interval_end + timedelta(hours=1)
+        created = self.store.create_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end, end, self.start)
+        with closing(self.store._connect()) as connection:
+            stored = connection.execute("SELECT model_mae FROM evaluation_run_snapshots WHERE snapshot_id=?", (created.snapshot.snapshot_id,)).fetchone()[0]
+            connection.execute("UPDATE evaluation_run_snapshots SET model_mae=? WHERE snapshot_id=?", (stored + 1e-6, created.snapshot.snapshot_id))
+            connection.commit()
+        reports = self.store.invalid_evaluation_run_snapshots()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["snapshot_id"], created.snapshot.snapshot_id)
+        self.assertEqual(reports[0]["evaluation_count"], 1)
+        self.assertEqual(reports[0]["stored_model_mae"], stored + 1e-6)
+        self.assertEqual(reports[0]["recomputed_model_mae"], stored)
+        self.assertAlmostEqual(reports[0]["model_mae_absolute_difference"], 1e-6)
+        self.assertTrue(reports[0]["all_nonnumeric_identity_invariants_valid"])
+        with self.assertRaisesRegex(ForecastIntegrityError, "invalid durable snapshot"):
+            self.store.find_evaluation_run_snapshot("v1", ARTIFACT, SCHEMA, 9, row.target_interval_end, end)
 
     def test_tampered_snapshot_provenance_and_metrics_fail_closed(self):
         row = self._evaluate(self.start, 12, 14, 10)
