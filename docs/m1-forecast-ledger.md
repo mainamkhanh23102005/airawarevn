@@ -1,5 +1,7 @@
 # AirAware VN M1 Forecast Ledger
 
+> Historical M1 implementation record. Deployment gates, runtime versions, and missing later monitoring stages below describe M1, not the current system. See the [README](../README.md#production-architecture) for current Render, Turso/libSQL, reconciliation, and scheduler behavior.
+
 ## Purpose
 
 M1 adds a traffic-independent foundation for recording scheduled production forecasts. It provides deterministic forecast identity, immutable SQLite development storage, a directly callable Forecast Issuer, and an opt-in `/forecast/current` read path. It does not reconcile observations, calculate errors, activate Render ledgering, or select a production scheduler/database.
