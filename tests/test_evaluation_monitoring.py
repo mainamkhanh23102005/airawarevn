@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -124,6 +125,67 @@ class EvaluationMonitoringTests(unittest.TestCase):
             with self.store._connect() as connection:
                 connection.execute(f"UPDATE evaluation_rows SET {column}=? WHERE evaluation_id=?", (12 if column == "predicted_pm25" else 2, row.evaluation_id))
                 connection.commit()
+
+    def test_diagnostic_reports_invalid_derived_errors_and_excludes_valid_rows(self):
+        invalid = self._evaluate(self.start, 12.1, 14.2, 10.3)
+        self._evaluate(self.start + timedelta(hours=1), 8, 7, 10)
+        with closing(self.store._connect()) as connection:
+            connection.execute("UPDATE evaluation_rows SET model_error=?, persistence_error=? WHERE evaluation_id=?",
+                (-1.8, -3.9, invalid.evaluation_id))
+            connection.commit()
+        reports = self.store.invalid_evaluation_rows()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["evaluation_id"], invalid.evaluation_id)
+        self.assertEqual(reports[0]["stored_model_error"], -1.8)
+        self.assertEqual(reports[0]["recomputed_model_error"], 12.1 - 10.3)
+        self.assertEqual(reports[0]["stored_absolute_model_error"], 1.8)
+        self.assertEqual(reports[0]["recomputed_absolute_model_error"], abs(12.1 - 10.3))
+        self.assertTrue(reports[0]["repairable_derived_errors_only"])
+
+    def test_durable_errors_accept_only_strict_float_round_trip_differences(self):
+        cases = (
+            (-15.230107416354995, -15.230107416354997),
+            (-14.6, -14.600000000000001),
+            (0.09999999999999788, 0.09999999999999787),
+        )
+        for offset, (stored, recomputed) in enumerate(cases):
+            with self.subTest(stored=stored, recomputed=recomputed):
+                row = self._evaluate(self.start + timedelta(hours=offset), 20, 19, 18)
+                with closing(self.store._connect()) as connection:
+                    connection.execute("UPDATE evaluation_rows SET predicted_pm25=?, observed_pm25=?, model_error=? WHERE evaluation_id=?",
+                        (18 + recomputed, 18, stored, row.evaluation_id))
+                    connection.execute("UPDATE forecasts SET predicted_pm25=? WHERE forecast_id=?", (18 + recomputed, row.forecast_id))
+                    connection.execute("UPDATE forecast_reconciliations SET observed_pm25=? WHERE reconciliation_id=?", (18, row.reconciliation_id))
+                    connection.commit()
+                loaded = self.store.get_evaluation(row.forecast_id)
+                self.assertEqual(loaded.model_error, recomputed)
+                self.assertEqual(abs(loaded.model_error), abs(recomputed))
+        self.assertEqual(self.store.invalid_evaluation_rows(), [])
+
+    def test_durable_persistence_error_accepts_round_trip_difference_and_publication_succeeds(self):
+        row = self._evaluate(self.start, 20, 3.4, 18)
+        with closing(self.store._connect()) as connection:
+            connection.execute("UPDATE evaluation_rows SET persistence_error=? WHERE evaluation_id=?", (-14.6, row.evaluation_id))
+            connection.commit()
+        loaded = self.store.get_evaluation(row.forecast_id)
+        self.assertEqual(loaded.persistence_error, 3.4 - 18)
+        result = materialize_available_evaluations(self.store, consumer_cohort=self._cohort(),
+            now=datetime(2026, 2, 2, 3, 15, tzinfo=ICT))
+        self.assertFalse(result.counts.get("failed"))
+        self.assertFalse(any(status == "failed" for _, status, _ in result.snapshot_results))
+        self.assertIsNotNone(result.consumer_publication)
+
+    def test_durable_errors_reject_material_difference_and_preserve_signed_semantics(self):
+        row = self._evaluate(self.start, 12, 14, 10)
+        self.assertEqual(row.model_error, 12 - 10)
+        self.assertEqual(row.persistence_error, 14 - 10)
+        self.assertEqual(abs(row.model_error), 2)
+        with closing(self.store._connect()) as connection:
+            connection.execute("UPDATE evaluation_rows SET model_error=?, persistence_error=? WHERE evaluation_id=?",
+                (row.model_error + 1e-6, row.persistence_error - 1e-6, row.evaluation_id))
+            connection.commit()
+        with self.assertRaisesRegex(Exception, "invalid durable evaluation row"):
+            self.store.get_evaluation(row.forecast_id)
 
     def test_tampered_snapshot_provenance_and_metrics_fail_closed(self):
         row = self._evaluate(self.start, 12, 14, 10)

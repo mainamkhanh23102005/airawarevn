@@ -24,6 +24,8 @@ EVALUATION_RUN_NAMESPACE = uuid.UUID("3c03496f-c34f-5b71-a62a-3a3b6430c613")
 CONSUMER_PUBLICATION_NAMESPACE = uuid.UUID("16ca2b67-725b-52f8-9a45-9c085fd6307d")
 SCHEMA_VERSION = 10
 MAX_RAW_EVIDENCE_BYTES = 2 * 1024 * 1024
+DERIVED_ERROR_REL_TOL = 0
+DERIVED_ERROR_ABS_TOL = 1e-12
 IDENTITY_FIELDS = (
     "sensor_id", "prediction_time", "target_interval_start", "target_interval_end",
     "forecast_horizon_hours", "model_version", "model_artifact_sha256", "feature_schema_sha256",
@@ -178,6 +180,11 @@ def _utc(value, name, hour_aligned=False):
 
 def _timestamp(value):
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _derived_error_matches(stored, recomputed):
+    return (isinstance(stored, (int, float)) and not isinstance(stored, bool) and math.isfinite(stored)
+        and math.isclose(stored, recomputed, rel_tol=DERIVED_ERROR_REL_TOL, abs_tol=DERIVED_ERROR_ABS_TOL))
 
 
 def _parse_timestamp(value):
@@ -474,6 +481,7 @@ class ForecastStore(Protocol):
     def current_consumer_performance(self, model_version, model_artifact_sha256, feature_schema_sha256, sensor_id,
                                      evaluation_policy_version=1, forecast_horizon_hours=6): ...
     def get_evaluation(self, forecast_id): ...
+    def invalid_evaluation_rows(self): ...
 
 
 class SQLiteForecastStore:
@@ -1201,7 +1209,8 @@ class SQLiteForecastStore:
             for name in ("target_interval_start", "target_interval_end", "evaluated_at"):
                 payload[name] = _parse_timestamp(payload[name])
             record = EvaluationRecord.create(**payload)
-            if stored_errors != (record.model_error, record.persistence_error):
+            if not all(_derived_error_matches(stored, recomputed)
+                       for stored, recomputed in zip(stored_errors, (record.model_error, record.persistence_error))):
                 raise ValueError("evaluation errors do not match predictions and truth")
             return record
         except (TypeError, ValueError, ForecastIntegrityError) as error:
@@ -1640,6 +1649,45 @@ class SQLiteForecastStore:
     def get_evaluation(self, forecast_id):
         with closing(self._connect()) as connection:
             return self._evaluation_row(connection.execute("SELECT * FROM evaluation_rows WHERE forecast_id=?", (forecast_id,)).fetchone())
+
+    def _evaluation_diagnostic(self, connection, row):
+        forecast = connection.execute("SELECT * FROM forecasts WHERE forecast_id=?", (row["forecast_id"],)).fetchone()
+        reconciliation = connection.execute("SELECT * FROM forecast_reconciliations WHERE reconciliation_id=?", (row["reconciliation_id"],)).fetchone()
+        try:
+            recomputed_model_error = float(row["predicted_pm25"]) - float(row["observed_pm25"])
+            recomputed_persistence_error = float(row["persistence_prediction"]) - float(row["observed_pm25"])
+            candidate = dict(row)
+            candidate["model_error"] = recomputed_model_error
+            candidate["persistence_error"] = recomputed_persistence_error
+            self._validate_durable_evaluation_relationship(connection, candidate)
+            repairable = True
+        except (TypeError, ValueError, ForecastIntegrityError):
+            recomputed_model_error = None
+            recomputed_persistence_error = None
+            repairable = False
+        absolute = lambda value: abs(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+        return {"evaluation_id": row["evaluation_id"], "forecast_id": row["forecast_id"],
+            "reconciliation_id": row["reconciliation_id"], "issued_at": None if forecast is None else forecast["issued_at"],
+            "target_interval_start": row["target_interval_start"], "target_interval_end": row["target_interval_end"],
+            "model_version": None if forecast is None else forecast["model_version"], "forecast_horizon_hours": None if forecast is None else forecast["forecast_horizon_hours"],
+            "predicted_pm25": row["predicted_pm25"], "persistence_prediction": row["persistence_prediction"],
+            "observed_pm25": row["observed_pm25"], "stored_model_error": row["model_error"],
+            "recomputed_model_error": recomputed_model_error, "stored_absolute_model_error": absolute(row["model_error"]),
+            "recomputed_absolute_model_error": absolute(recomputed_model_error), "stored_persistence_error": row["persistence_error"],
+            "recomputed_persistence_error": recomputed_persistence_error, "stored_absolute_persistence_error": absolute(row["persistence_error"]),
+            "recomputed_absolute_persistence_error": absolute(recomputed_persistence_error),
+            "evaluation_policy_version": row["evaluation_policy_version"],
+            "repairable_derived_errors_only": repairable}
+
+    def invalid_evaluation_rows(self):
+        with closing(self._connect()) as connection:
+            reports = []
+            for row in connection.execute("SELECT * FROM evaluation_rows ORDER BY target_interval_end, evaluation_id"):
+                try:
+                    self._validate_durable_evaluation_relationship(connection, row)
+                except ForecastIntegrityError:
+                    reports.append(self._evaluation_diagnostic(connection, row))
+            return reports
 
     def count_evaluations(self):
         with closing(self._connect()) as connection:
