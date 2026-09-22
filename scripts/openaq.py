@@ -224,11 +224,11 @@ def normalize_measurement(row, sensor_id, preserve_decimal=False):
     return record
 
 
-def fetch_hours(client, api_key, sensor_id, start, end, raw_directory, limit=1000, sleep=time.sleep, now=lambda: datetime.now(UTC), preserve_decimal=False):
+def fetch_hours(client, api_key, sensor_id, start, end, raw_directory, limit=1000, sleep=time.sleep, now=lambda: datetime.now(UTC), preserve_decimal=False, endpoint="hours"):
     records, provenance, page = [], [], 1
     while True:
         params = {"datetime_from": start.isoformat(), "datetime_to": end.isoformat(), "limit": limit, "page": page}
-        payload, item = _request(client, api_key, f"/sensors/{sensor_id}/hours", params, raw_directory, sensor_id, sleep, now, preserve_decimal)
+        payload, item = _request(client, api_key, f"/sensors/{sensor_id}/{endpoint}", params, raw_directory, sensor_id, sleep, now, preserve_decimal)
         rows = payload.get("results", [])
         if not isinstance(rows, list):
             raise OpenAQError("OpenAQ results is not a list")
