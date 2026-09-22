@@ -22,14 +22,15 @@ def refresh_current_pm25(client, api_key, sensor_id, artifact_directory, history
     end = retrieved_at
     start = retrieved_at.replace(minute=0, second=0, microsecond=0) - timedelta(hours=history_hours)
     raw_directory = artifact_directory / "raw" / "openaq"
-    records, provenance = openaq.fetch_hours(client, api_key, sensor_id, start, end, raw_directory, now=lambda: retrieved_at)
+    endpoint = "measurements/hourly"
+    records, provenance = openaq.fetch_hours(client, api_key, sensor_id, start, end, raw_directory, now=lambda: retrieved_at, endpoint=endpoint)
     artifact = {
         "artifact_version": 1,
         "sensor_id": sensor_id,
         "retrieved_at": retrieved_at.isoformat(),
         "source": {
             "provider": "OpenAQ",
-            "endpoint": f"/sensors/{sensor_id}/hours",
+            "endpoint": f"/sensors/{sensor_id}/{endpoint}",
             "datetime_from": start.isoformat(),
             "datetime_to": end.isoformat(),
         },

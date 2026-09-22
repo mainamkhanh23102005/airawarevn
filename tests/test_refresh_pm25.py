@@ -17,11 +17,16 @@ def hour_row(start, value=12.5, row_id=1):
     return {
         "id": row_id,
         "value": value,
-        "parameter": {"id": 2, "name": "pm25", "units": "µg/m³"},
+        "flagInfo": {"hasFlags": False},
+        "parameter": {"id": 2, "name": "pm25", "units": "µg/m³", "displayName": None},
         "period": {
+            "label": "1 hour",
+            "interval": "01:00:00",
             "datetimeFrom": {"utc": start.isoformat().replace("+00:00", "Z")},
             "datetimeTo": {"utc": end.isoformat().replace("+00:00", "Z")},
         },
+        "coordinates": None,
+        "summary": {"min": value, "median": value, "max": value, "avg": value},
     }
 
 
@@ -44,9 +49,14 @@ class RefreshPm25Tests(unittest.TestCase):
         self.assertEqual(artifact["sensor_id"], 13502151)
         self.assertEqual(artifact["retrieved_at"], now.isoformat())
         self.assertEqual(len(artifact["normalized_records"]), 48)
-        self.assertEqual(artifact["source"]["endpoint"], "/sensors/13502151/hours")
-        self.assertTrue(artifact["provenance"])
+        self.assertEqual(artifact["source"]["endpoint"], "/sensors/13502151/measurements/hourly")
+        self.assertEqual(artifact["provenance"][0]["endpoint"], "/sensors/13502151/measurements/hourly")
+        self.assertTrue(artifact["normalized_records"])
+        self.assertEqual(artifact["normalized_records"][0]["value"], rows[0]["value"])
+        self.assertEqual(artifact["normalized_records"][0]["event_time"], rows[0]["period"]["datetimeFrom"]["utc"].replace("Z", "+00:00"))
         self.assertNotIn("secret", json.dumps(artifact))
+        self.assertEqual(requests[0].url.path, "/v3/sensors/13502151/measurements/hourly")
+        self.assertNotEqual(requests[0].url.path, "/v3/sensors/13502151/hours")
         self.assertEqual(requests[0].url.params["datetime_from"], (now.replace(minute=0) - timedelta(hours=72)).isoformat())
         self.assertEqual(requests[0].url.params["datetime_to"], now.isoformat())
 
